@@ -4,7 +4,7 @@ welcome.pdf
 __pycache__/
 *.pyc
 
-# data lives on /storage; "data" is a symlink on the server
-data
+# rendered data inside dataset/ (only the .py files are tracked)
+dataset/*/
 *.ply
 *.npz
