@@ -43,7 +43,12 @@ BACKGROUNDS = {"white": (255, 255, 255), "black": (0, 0, 0), "none": None}
 
 def load_mesh(path: str | Path, use_texture: bool = True, smooth: bool = False):
     """Load a mesh file, normalize it to the unit sphere, return pyrender meshes + normalization."""
-    scene = trimesh.load(str(path), force="scene", process=False)
+    path = Path(path)
+    if path.suffix == ".npz":  # shapenet_partial_views format: arrays `vertices` (V,3), `faces` (F,3)
+        data = np.load(path)
+        scene = trimesh.Scene(trimesh.Trimesh(vertices=data["vertices"], faces=data["faces"], process=False))
+    else:
+        scene = trimesh.load(str(path), force="scene", process=False)
 
     parts = []
     for node in scene.graph.nodes_geometry:
@@ -69,7 +74,8 @@ def load_mesh(path: str | Path, use_texture: bool = True, smooth: bool = False):
     for p in parts:
         p.apply_translation(-center)
         p.apply_scale(scale)
-        if use_texture:
+        has_appearance = p.visual.kind is not None  # texture or colors present in the file
+        if use_texture and has_appearance:
             mesh = pyrender.Mesh.from_trimesh(p, smooth=smooth)
         else:
             p.visual = trimesh.visual.ColorVisuals()
@@ -220,7 +226,8 @@ def render_views(
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(prog="python -m dataset.render", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--mesh", required=True, help="mesh file (.obj, .glb, .ply, .off, ...)")
+    p.add_argument("--mesh", required=True,
+                   help="mesh file (.obj, .glb, .ply, .off, ... or mesh.npz with vertices/faces)")
     p.add_argument("--out", required=True, help="output folder")
     p.add_argument("--n-views", type=int, default=24)
     p.add_argument("--res", type=int, default=518, help="square image size (518 = VGGT input width)")
