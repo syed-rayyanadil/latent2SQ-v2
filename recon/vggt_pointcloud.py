@@ -24,6 +24,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from dataset.ply import write_ply
+
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 
 
@@ -32,24 +34,6 @@ def list_images(folder: str | Path) -> list[str]:
     if not files:
         raise FileNotFoundError(f"No images found in {folder}")
     return files
-
-
-def write_ply(path: str | Path, points: np.ndarray, colors: np.ndarray) -> None:
-    """Binary little-endian PLY with xyz float32 + rgb uint8."""
-    vertex = np.empty(len(points), dtype=[("x", "<f4"), ("y", "<f4"), ("z", "<f4"),
-                                          ("red", "u1"), ("green", "u1"), ("blue", "u1")])
-    vertex["x"], vertex["y"], vertex["z"] = points[:, 0], points[:, 1], points[:, 2]
-    vertex["red"], vertex["green"], vertex["blue"] = colors[:, 0], colors[:, 1], colors[:, 2]
-    header = (
-        "ply\nformat binary_little_endian 1.0\n"
-        f"element vertex {len(points)}\n"
-        "property float x\nproperty float y\nproperty float z\n"
-        "property uchar red\nproperty uchar green\nproperty uchar blue\n"
-        "end_header\n"
-    )
-    with open(path, "wb") as f:
-        f.write(header.encode("ascii"))
-        f.write(vertex.tobytes())
 
 
 @torch.no_grad()

@@ -1,0 +1,5 @@
+# Versions pinned by vggt -- pass with `-c constraints.txt` when installing other requirements
+# so they cannot silently upgrade torch/numpy in the l2sq env.
+torch==2.3.1
+torchvision==0.18.1
+numpy==1.26.1
