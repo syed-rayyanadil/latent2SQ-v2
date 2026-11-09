@@ -1,0 +1,5 @@
+# local-only files
+welcome.pdf
+.DS_Store
+__pycache__/
+*.pyc
