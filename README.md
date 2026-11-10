@@ -144,7 +144,7 @@ Per sample: N ∈ [1, 8] random train views, the first is the reference. Targets
 ```bash
 python -m recon.view --mesh runs/chair_L1/examples/test_N8_0/gt_sq.ply runs/chair_L1/examples/test_N8_0/pred_sq.ply
 ```
-Options: `--layers 3`, `--queries 16`, `--steps 3000`, `--batch 2`, `--vggt-layer 23`, `--w-t/--w-R/--w-scale/--w-eps/--w-exist` loss weights, `--no-tb`.
+Options: `--layers 3`, `--queries 16`, `--steps 3000`, `--batch 2`, `--vggt-layer 23`, `--w-t/--w-R/--w-scale/--w-eps/--w-exist` loss weights, `--scale-loss log|linear` (default log: MSE on log(scale), i.e. relative size errors; `runs/chair_L1` used linear), `--no-tb`.
 
 **What can we expect?** All against the GT point cloud (`gt_world.npz`), same metric as `eval_vggt`: the pseudo-GT superquadrics (the decoder's ceiling), VGGT's aligned clouds, and the run's predicted / target superquadrics:
 ```bash

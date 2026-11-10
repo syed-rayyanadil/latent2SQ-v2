@@ -7,8 +7,8 @@ Run from the repo root:
 
 Each batch draws one N in [n_min, n_max]; each sample draws N distinct views from the TRAIN pool,
 the first being the reference. Targets are the pseudo-GT superquadrics in that sample's VGGT
-frame (l2sq/data.py). Loss: MSE on translation, rotation matrix, scale, exponents for the GT
-slots (GT superquadric m <-> query m, a fixed assignment that is valid for a single object)
+frame (l2sq/data.py). Loss: MSE on translation, rotation matrix, log(scale) (--scale-loss),
+exponents for the GT slots (GT superquadric m <-> query m, a fixed assignment that is valid for a single object)
 + BCE on existence for all P queries.
 
 Evaluation uses fixed samples for N in {1,2,4,8} from the TRAIN views and from the TEST views
@@ -46,7 +46,9 @@ EVAL_NS = (1, 2, 4, 8)
 
 # --------------------------------------------------------------------------- loss
 
-def mse_loss(pred: dict, tgt: dict, w: dict) -> tuple[torch.Tensor, dict]:
+def mse_loss(pred: dict, tgt: dict, w: dict, scale_loss: str = "log") -> tuple[torch.Tensor, dict]:
+    """scale_loss 'log': MSE of log(scale), i.e. relative size errors, so a 50 % error on a
+    thin chair leg costs as much as on the seat ('linear' lets thin axes go almost free)."""
     m = tgt["exist"]                                   # (B,P), 1 for GT slots
     n = m.sum().clamp_min(1.0)
 
@@ -56,7 +58,8 @@ def mse_loss(pred: dict, tgt: dict, w: dict) -> tuple[torch.Tensor, dict]:
     parts = {
         "t": masked(pred["t"], tgt["t"]),
         "R": masked(pred["R"], tgt["R"]),
-        "scale": masked(pred["scale"], tgt["scale"]),
+        "scale": (masked(pred["scale"].log(), tgt["scale"].log()) if scale_loss == "log"
+                  else masked(pred["scale"], tgt["scale"])),
         "eps": masked(pred["eps"], tgt["eps"]),
         "exist": F.binary_cross_entropy_with_logits(pred["exist_logit"], m),
     }
@@ -72,7 +75,7 @@ def eval_samples(pool, gt, ns, per_n, seed):
 
 
 @torch.no_grad()
-def evaluate(vggt, dec, pool, samples_by_n, P, batch, device, w) -> dict:
+def evaluate(vggt, dec, pool, samples_by_n, P, batch, device, w, scale_loss="log") -> dict:
     dec.eval()
     out = {}
     for n, samples in samples_by_n.items():
@@ -82,7 +85,7 @@ def evaluate(vggt, dec, pool, samples_by_n, P, batch, device, w) -> dict:
             chunk = samples[i:i + batch]
             tgt = collate(pool, chunk, P, device)
             pred = dec(vggt(tgt["images"]))
-            loss, _ = mse_loss(pred, tgt, w)
+            loss, _ = mse_loss(pred, tgt, w, scale_loss)
             acc["loss"].append(float(loss))
             m = tgt["exist"] > 0.5
             s = tgt["s"][:, None]
@@ -163,6 +166,8 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--w-scale", type=float, default=1.0)
     p.add_argument("--w-eps", type=float, default=1.0)
     p.add_argument("--w-exist", type=float, default=1.0)
+    p.add_argument("--scale-loss", choices=["log", "linear"], default="log",
+                   help="MSE on log(scale) (relative errors, default) or on scale (runs/chair_L1 used linear)")
     # logging / eval
     p.add_argument("--log-every", type=int, default=25)
     p.add_argument("--eval-every", type=int, default=250)
@@ -212,7 +217,7 @@ def main(argv: list[str] | None = None) -> None:
         n = int(rng.integers(a.n_min, a.n_max + 1))
         batch = [make_sample(train_pool, gt, random_views(rng, len(train_pool), n)) for _ in range(a.batch)]
         tgt = collate(train_pool, batch, a.queries, device)
-        loss, parts = mse_loss(dec(vggt(tgt["images"])), tgt, w)
+        loss, parts = mse_loss(dec(vggt(tgt["images"])), tgt, w, a.scale_loss)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(dec.parameters(), 1.0)
@@ -224,18 +229,24 @@ def main(argv: list[str] | None = None) -> None:
         if step % a.log_every == 0:
             msg = "  ".join(f"{k} {v / a.log_every:.4g}" for k, v in running.items())
             sec = (time.time() - t0) / a.log_every
-            print(f"step {step:5d}  {msg}  lr {sched.get_last_lr()[0]:.2e}  {sec:.2f}s/step", file=sys.stderr)
+            # peak memory actually used by tensors in this interval (nvidia-smi shows PyTorch's cache instead)
+            mem = torch.cuda.max_memory_allocated() / 2**30 if device == "cuda" else 0.0
+            if device == "cuda":
+                torch.cuda.reset_peak_memory_stats()
+            print(f"step {step:5d}  {msg}  lr {sched.get_last_lr()[0]:.2e}  {sec:.2f}s/step  "
+                  f"peak {mem:.1f} GB", file=sys.stderr)
             if tb is not None:
                 for k, v in running.items():
                     tb.add_scalar(f"train_loss/{k}", v / a.log_every, step)
                 tb.add_scalar("misc/lr", sched.get_last_lr()[0], step)
                 tb.add_scalar("misc/sec_per_step", sec, step)
+                tb.add_scalar("misc/gpu_peak_gb", mem, step)
             running, t0 = {}, time.time()
 
         if step % a.eval_every == 0 or step == a.steps:
             res = {"step": step}
             for split, (pool, samples) in eval_sets.items():
-                res[split] = evaluate(vggt, dec, pool, samples, a.queries, a.batch, device, w)
+                res[split] = evaluate(vggt, dec, pool, samples, a.queries, a.batch, device, w, a.scale_loss)
             metrics_f.write(json.dumps(res) + "\n")
             metrics_f.flush()
             for split, writer in tb_eval.items():
