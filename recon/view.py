@@ -2,15 +2,19 @@
 
 Run on the server from the repo root:
 
-    python -m recon.view dataset/chair_test            # loads gt_sq.ply, gt.ply, vggt.ply if present
-    python -m recon.view --mesh a.ply --pc b.ply c.ply  # or explicit files
+    python -m recon.view dataset/chair/train   # split folder: gt.ply, vggt.ply + ../gt_sq_rigid.ply, in this split's cam0
+    python -m recon.view dataset/chair         # object folder: gt_sq_rigid.ply + gt_world.ply, in the world frame
+    python -m recon.view --mesh a.ply --pc b.ply c.ply   # explicit files, shown as saved
 
-then open http://localhost:8080 on your Mac. VS Code Remote-SSH forwards the port
-automatically; from a plain terminal use:
+then open the printed URL (http://localhost:<port>) on your Mac. VS Code Remote-SSH forwards
+the port automatically; from a plain terminal use:
     ssh -p 58022 -L 8080:localhost:8080 hdo@atcremers66.in.tum.de
 
-Everything is shown in the frame it was saved in. For our files that is cam0 (OpenCV:
-y down, z forward), and the initial view is rendered camera 0, i.e. images/000.png.
+Frames (dataset layout dataset/<obj>/{train,test}/):
+  * split folder (has cameras.json): everything in that split's camera-0 frame (OpenCV: y down,
+    z forward); the initial view is rendered camera 0, i.e. images/000.png. The world-frame
+    superquadrics from the object folder are moved in with camera 0's w2c.
+  * object folder: world frame (mesh centered, unit sphere, y up).
 VGGT's cloud has an arbitrary scale; by default it is rescaled to the GT with the scale
 estimated from the cameras (same as recon.eval_vggt), see --vggt-align.
 """
@@ -18,6 +22,7 @@ estimated from the cameras (same as recon.eval_vggt), see --vggt-align.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -25,8 +30,9 @@ from pathlib import Path
 import numpy as np
 import trimesh
 
-DEFAULT_MESHES = ["gt_sq.ply"]
-DEFAULT_PCS = ["gt.ply", "vggt.ply"]
+SQ_NAMES = ["gt_sq_rigid.ply", "gt_sq.ply"]   # world-frame superquadrics in the object folder
+SPLIT_PCS = ["gt.ply", "vggt.ply"]            # cam0-frame clouds in a split folder
+OBJECT_PCS = ["gt_world.ply"]                 # world-frame cloud in the object folder
 
 
 def load_pc(path: Path, max_points: int, rng) -> tuple[np.ndarray, np.ndarray]:
@@ -40,12 +46,28 @@ def load_pc(path: Path, max_points: int, rng) -> tuple[np.ndarray, np.ndarray]:
     return pts, cols.astype(np.uint8)
 
 
+def collect(folder: Path):
+    """Files to show for a split or object folder: (meshes [(path, 4x4 or None)], clouds, frame)."""
+    if (folder / "cameras.json").exists():  # split folder -> its camera-0 frame
+        cams = json.loads((folder / "cameras.json").read_text())
+        T = np.eye(4)
+        T[:3] = np.asarray(cams["frames"][0]["w2c"])   # world -> cam0 (rigid, metric)
+        sq = next((folder.parent / n for n in SQ_NAMES if (folder.parent / n).exists()), None)
+        meshes = [(sq, T)] if sq else []
+        pcs = [folder / f for f in SPLIT_PCS if (folder / f).exists()]
+        return meshes, pcs, "cam0"
+    sq = next((folder / n for n in SQ_NAMES if (folder / n).exists()), None)
+    meshes = [(sq, None)] if sq else []
+    pcs = [folder / f for f in OBJECT_PCS if (folder / f).exists()]
+    return meshes, pcs, "world"
+
+
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(prog="python -m recon.view", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("folder", nargs="?", help=f"folder with {DEFAULT_MESHES + DEFAULT_PCS}")
-    p.add_argument("--mesh", nargs="*", default=[], help="mesh files (e.g. superquadric .ply)")
-    p.add_argument("--pc", nargs="*", default=[], help="point cloud files (.ply)")
+    p.add_argument("folder", nargs="?", help="split folder (dataset/<obj>/train) or object folder (dataset/<obj>)")
+    p.add_argument("--mesh", nargs="*", default=[], help="extra mesh files, shown as saved")
+    p.add_argument("--pc", nargs="*", default=[], help="extra point cloud files (.ply), shown as saved")
     p.add_argument("--port", type=int, default=8080)
     p.add_argument("--max-points", type=int, default=50_000, help="subsample each cloud for the browser")
     p.add_argument("--point-size", type=float, default=0.01)
@@ -54,13 +76,16 @@ def main(argv: list[str] | None = None) -> None:
                         "(Umeyama from cameras), 'none' (raw), or a number (manual scale)")
     a = p.parse_args(argv)
 
-    meshes, pcs = [Path(m) for m in a.mesh], [Path(c) for c in a.pc]
+    meshes = [(Path(m), None) for m in a.mesh]
+    pcs = [Path(c) for c in a.pc]
+    frame = "cam0"
     if a.folder:
-        folder = Path(a.folder)
-        meshes += [folder / f for f in DEFAULT_MESHES if (folder / f).exists()]
-        pcs += [folder / f for f in DEFAULT_PCS if (folder / f).exists()]
+        m, c, frame = collect(Path(a.folder))
+        meshes += m
+        pcs += c
     if not meshes and not pcs:
-        p.error("nothing to show: give a folder or --mesh/--pc files")
+        p.error(f"nothing to show in {a.folder}: expected {SPLIT_PCS} (split folder) or "
+                f"{SQ_NAMES[0]} / {OBJECT_PCS} (object folder), or give --mesh/--pc files")
 
     import viser  # imported late so --help works without it
 
@@ -68,8 +93,7 @@ def main(argv: list[str] | None = None) -> None:
     clouds = {path: load_pc(path, a.max_points, rng) for path in pcs}
 
     # Place VGGT's cloud on the GT. Its scale is arbitrary; the alignment comes from the cameras
-    # (Umeyama on predicted vs GT camera centers, see recon/align.py), which needs
-    # cameras.json + vggt_pred.npz next to vggt.ply.
+    # (see recon/align.py), which needs cameras.json + vggt_pred.npz next to vggt.ply.
     for path, (pts, cols) in clouds.items():
         if path.stem != "vggt" or a.vggt_align == "none":
             continue
@@ -77,23 +101,28 @@ def main(argv: list[str] | None = None) -> None:
             s, R, t = float(a.vggt_align), np.eye(3), np.zeros(3)
             how = "manual scale"
         except ValueError:
-            from recon.align import align_from_cameras, apply_sim3, load_case
+            from recon.align import align_from_cameras, load_case
             if not ((path.parent / "cameras.json").exists() and (path.parent / "vggt_pred.npz").exists()):
                 print(f"{path.name}: no cameras.json / vggt_pred.npz next to it, shown unaligned", file=sys.stderr)
                 continue
             cams, pred = load_case(path.parent)
             s, R, t = align_from_cameras(cams, pred["extrinsic"], a.vggt_align)
             how = f"{a.vggt_align} from cameras"
-        clouds[path] = (apply_sim3(pts, s, R, t).astype(np.float32) if how != "manual scale" else pts * s, cols)
+        clouds[path] = ((s * pts @ R.T + t).astype(np.float32), cols)
         print(f"{path.name}: aligned ({how}), scale x{s:.3f}", file=sys.stderr)
 
     server = viser.ViserServer(port=a.port)
-    server.scene.set_up_direction("-y")  # cam0 / OpenCV frame: y points down
-    server.scene.add_frame("/cam0", axes_length=0.2, axes_radius=0.005)
+    up = (0.0, -1.0, 0.0) if frame == "cam0" else (0.0, 1.0, 0.0)  # OpenCV camera: y down; world: y up
+    server.scene.set_up_direction(up)
+    server.scene.add_frame("/origin", axes_length=0.2, axes_radius=0.005)
 
     handles = {}
-    for path in meshes:
-        handles[path.name] = server.scene.add_mesh_trimesh(f"/mesh/{path.stem}", mesh=trimesh.load(str(path), process=False))
+    for path, T in meshes:
+        mesh = trimesh.load(str(path), process=False)
+        if T is not None:
+            mesh.apply_transform(T)
+        handles[path.name] = server.scene.add_mesh_trimesh(f"/mesh/{path.stem}", mesh=mesh)
+        print(f"{path}: {'moved into ' + frame if T is not None else 'as saved'}", file=sys.stderr)
     for path, (pts, cols) in clouds.items():
         handles[path.name] = server.scene.add_point_cloud(f"/pc/{path.stem}", points=pts, colors=cols,
                                                           point_size=a.point_size)
@@ -114,16 +143,23 @@ def main(argv: list[str] | None = None) -> None:
             if hasattr(h, "point_size"):
                 h.point_size = event.target.value
 
-    all_pts = np.concatenate([c[0] for c in clouds.values()]) if clouds else trimesh.load(str(meshes[0])).vertices
-    center = tuple(float(v) for v in np.median(all_pts, axis=0))
+    all_pts = (np.concatenate([c[0] for c in clouds.values()]) if clouds
+               else np.asarray(trimesh.load(str(meshes[0][0])).vertices))
+    center = np.median(all_pts, axis=0)
+    # cam0: start at rendered camera 0; world: start 2.5 units in front of and slightly above the object
+    start = np.zeros(3) if frame == "cam0" else center + np.array([0.0, 0.8, 2.5])
 
     @server.on_client_connect
     def _(client) -> None:
-        client.camera.position = (0.0, 0.0, 0.0)  # start at rendered camera 0
-        client.camera.look_at = center
-        client.camera.up_direction = (0.0, -1.0, 0.0)
+        client.camera.position = tuple(float(v) for v in start)
+        client.camera.look_at = tuple(float(v) for v in center)
+        client.camera.up_direction = up
 
-    print(f"Viewer running: open http://localhost:{a.port}  (Ctrl+C to stop)", file=sys.stderr)
+    port = server.get_port()
+    print(f"Viewer running ({frame} frame): open http://localhost:{port}  (Ctrl+C to stop)", file=sys.stderr)
+    if port != a.port:
+        print(f"  note: port {a.port} was busy (an old viewer still running?), using {port} -- forward that one",
+              file=sys.stderr)
     try:
         while True:
             time.sleep(1.0)
