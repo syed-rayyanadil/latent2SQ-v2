@@ -102,7 +102,7 @@ def evaluate(vggt, dec, pool, samples_by_n, P, batch, device, w, scale_loss="log
                 g_pts = sample_surface(tgt["scale"][b][m[b]], tgt["eps"][b][m[b]], tgt["R"][b][m[b]], tgt["t"][b][m[b]]).reshape(-1, 3)
                 acc["chamfer_world"].append(float(chamfer(p_pts, g_pts) * tgt["s"][b]))
         out[f"N{n}"] = {k: float(np.mean(v)) for k, v in acc.items()}
-    out["all"] = {k: float(np.mean([out[f"N{n}"][k] for n in samples_by_n])) for k in out[f"N{EVAL_NS[0]}"]}
+    out["all"] = {k: float(np.mean([out[f"N{n}"][k] for n in samples_by_n])) for k in next(iter(out.values()))}
     dec.train()
     return out
 

@@ -146,6 +146,12 @@ python -m recon.view --mesh runs/chair_L1/examples/test_N8_0/gt_sq.ply runs/chai
 ```
 Options: `--layers 3`, `--queries 16`, `--steps 3000`, `--batch 2`, `--vggt-layer 23`, `--w-t/--w-R/--w-scale/--w-eps/--w-exist` loss weights, `--scale-loss log|linear` (default log: MSE on log(scale), i.e. relative size errors; `runs/chair_L1` used linear), `--no-tb`.
 
+**Predict on a split** with views 0…N−1 (reference = camera 0, so it lines up with the split viewer):
+```bash
+python -m l2sq.predict runs/chair_L1_logscale dataset/chair/test -n 8 24
+python -m recon.view dataset/chair/test --mesh runs/chair_L1_logscale/predict/test_N8_0/pred_sq.ply
+```
+
 **What can we expect?** All against the GT point cloud (`gt_world.npz`), same metric as `eval_vggt`: the pseudo-GT superquadrics (the decoder's ceiling), VGGT's aligned clouds, and the run's predicted / target superquadrics:
 ```bash
 python -m recon.eval_sq $OBJ --run runs/chair_L1     # -> runs/chair_L1/eval_sq.json (without --run: $OBJ/eval_sq.json)
