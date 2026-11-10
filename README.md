@@ -146,6 +146,12 @@ python -m recon.view --mesh runs/chair_L1/examples/test_N8_0/gt_sq.ply runs/chai
 ```
 Options: `--layers 3`, `--queries 16`, `--steps 3000`, `--batch 2`, `--vggt-layer 23`, `--w-t/--w-R/--w-scale/--w-eps/--w-exist` loss weights, `--no-tb`.
 
+**What can we expect?** All against the GT point cloud (`gt_world.npz`), same metric as `eval_vggt`: the pseudo-GT superquadrics (the decoder's ceiling), VGGT's aligned clouds, and the run's predicted / target superquadrics:
+```bash
+python -m recon.eval_sq $OBJ --run runs/chair_L1     # -> runs/chair_L1/eval_sq.json (without --run: $OBJ/eval_sq.json)
+```
+Note the training log's `chamfer` is predicted vs **pseudo-GT superquadrics**, not vs the GT points.
+
 `recon.eval_vggt` on a folder with `depth/` also prints the **scale ratio**: VGGT's fitted scale divided by *s* from the GT depth. ~1 means our targets use the same normalization VGGT was trained with.
 
 **TensorBoard** (`runs/<name>/tb`): training losses, lr, s/step, and all eval metrics with train and test views overlaid (`eval_all/…` averaged over N, `eval_N<n>/…` per N):
