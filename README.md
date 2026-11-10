@@ -33,7 +33,7 @@ conda create -n l2sq python=3.10 -y
 conda activate l2sq
 pip install -r vggt/requirements.txt
 pip install -e vggt
-pip install -r requirements.txt
+pip install -r requirements.txt -c constraints.txt   # pyrender, trimesh, tensorboard
 ```
 
 SuperFlex deps — `-c constraints.txt` stops pip from upgrading torch/numpy, `-f` gets a prebuilt `torch-cluster`:
@@ -128,6 +128,13 @@ gdown --folder 1yz4rwho0rsQGb5pEQcPIucZUjohOlfBN -O superflex/checkpoints/base
 python -m dataset.sample_gt --cameras $OBJ/train/cameras.json --frame world --out $OBJ/gt_world.ply
 python -m recon.gt_superquadrics --rigid --gt $OBJ/gt_world.npz --cameras $OBJ/train/cameras.json --out $OBJ/gt_sq_rigid
 
+# sanity check: VGGT on all 24 views of each split (expect scale ratio ~1, Chamfer ~0.01)
+for SPLIT in train test; do
+  python -m recon.vggt_pointcloud --images $OBJ/$SPLIT/images --out $OBJ/$SPLIT/vggt.ply
+  python -m dataset.sample_gt --cameras $OBJ/$SPLIT/cameras.json --out $OBJ/$SPLIT/gt.ply
+  python -m recon.eval_vggt $OBJ/$SPLIT
+done
+
 # train (L = 1 decoder layer, P = 16 queries)
 python -m l2sq.train --train $OBJ/train --test $OBJ/test --gt-sq $OBJ/gt_sq_rigid.npz --out runs/chair_L1
 ```
@@ -137,7 +144,16 @@ Per sample: N ∈ [1, 8] random train views, the first is the reference. Targets
 ```bash
 python -m recon.view --mesh runs/chair_L1/examples/test_N8_0/gt_sq.ply runs/chair_L1/examples/test_N8_0/pred_sq.ply
 ```
-Options: `--layers 3`, `--queries 16`, `--steps 3000`, `--batch 2`, `--vggt-layer 23`, `--w-t/--w-R/--w-scale/--w-eps/--w-exist` loss weights.
+Options: `--layers 3`, `--queries 16`, `--steps 3000`, `--batch 2`, `--vggt-layer 23`, `--w-t/--w-R/--w-scale/--w-eps/--w-exist` loss weights, `--no-tb`.
+
+`recon.eval_vggt` on a folder with `depth/` also prints the **scale ratio**: VGGT's fitted scale divided by *s* from the GT depth. ~1 means our targets use the same normalization VGGT was trained with.
+
+**TensorBoard** (`runs/<name>/tb`): training losses, lr, s/step, and all eval metrics with train and test views overlaid (`eval_all/…` averaged over N, `eval_N<n>/…` per N):
+```bash
+tensorboard --logdir runs --port 6006     # on the server (localhost only)
+ssh -p 58022 -L 6006:localhost:6006 hdo@atcremers66.in.tum.de   # on your laptop, then open http://localhost:6006
+```
+(VS Code Remote-SSH forwards the port automatically.)
 
 ### Download results to your laptop
 ```bash

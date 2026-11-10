@@ -18,6 +18,7 @@ import numpy as np
 import torch
 
 from l2sq.sq import to_view_frame
+from recon.align import depth_points_world, vggt_normalization
 
 
 @dataclass
@@ -40,30 +41,19 @@ class ViewPool:
         cams = json.loads((self.folder / "cameras.json").read_text())
         self.K = np.asarray(cams["K"])
         self.w2c = np.stack([np.asarray(f["w2c"]) for f in cams["frames"]])     # (V,3,4)
-        c2w = np.stack([np.asarray(f["c2w"]) for f in cams["frames"]])          # (V,4,4)
         files = [str(self.folder / f["file"]) for f in cams["frames"]]
         self.images = load_and_preprocess_images(files)                         # (V,3,518,518) in [0,1]
         if self.images.shape[-2:] != (cams["height"], cams["width"]):
             raise ValueError(f"VGGT preprocessing changed the image size to {tuple(self.images.shape[-2:])}; "
                              "render square 518x518 views.")
 
-        self.points_world = []  # per view: GT depth points in the world frame
-        for v in range(len(files)):
-            depth = np.load(self.folder / "depth" / f"{v:03d}.npy")
-            ys, xs = np.nonzero(depth > 0)
-            ys, xs = ys[::stride], xs[::stride]
-            z = depth[ys, xs]
-            pc = np.stack([(xs + 0.5 - self.K[0, 2]) / self.K[0, 0] * z,
-                           (ys + 0.5 - self.K[1, 2]) / self.K[1, 1] * z, z], 1)
-            self.points_world.append(pc @ c2w[v, :3, :3].T + c2w[v, :3, 3])
+        self.points_world = depth_points_world(self.folder, cams, stride)  # per view, world frame
 
     def __len__(self) -> int:
         return len(self.points_world)
 
     def normalization(self, views: list[int]) -> float:
-        R0, t0 = self.w2c[views[0], :, :3], self.w2c[views[0], :, 3]
-        pts = np.concatenate([self.points_world[v] for v in views])
-        return float(np.linalg.norm(pts @ R0.T + t0, axis=1).mean())
+        return vggt_normalization(self.points_world, self.w2c[views[0]], views)
 
 
 class GTSuperquadrics:

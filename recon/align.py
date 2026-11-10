@@ -105,6 +105,36 @@ def camera_errors(cams: dict, pred: dict, sim3) -> dict:
     }
 
 
+# --------------------------------------------------------------------------- GT depth / VGGT normalization
+
+def depth_points_world(folder: str | Path, cams: dict, stride: int = 4) -> list[np.ndarray]:
+    """Per view: GT depth points (every `stride`-th valid pixel) in the render world frame.
+
+    Needs depth/<view>.npy from dataset.render --save-depth (z-depth, 0 = background).
+    Taking every k-th valid pixel keeps each view's weight proportional to its pixel count.
+    """
+    folder = Path(folder)
+    K = np.asarray(cams["K"])
+    out = []
+    for v, f in enumerate(cams["frames"]):
+        depth = np.load(folder / "depth" / f"{v:03d}.npy")
+        ys, xs = np.nonzero(depth > 0)
+        ys, xs = ys[::stride], xs[::stride]
+        z = depth[ys, xs]
+        pc = np.stack([(xs + 0.5 - K[0, 2]) / K[0, 0] * z, (ys + 0.5 - K[1, 2]) / K[1, 1] * z, z], 1)
+        c2w = np.asarray(f["c2w"])
+        out.append(pc @ c2w[:3, :3].T + c2w[:3, 3])
+    return out
+
+
+def vggt_normalization(points_world: list[np.ndarray], w2c_ref: np.ndarray, views=None) -> float:
+    """VGGT's scale normalization (paper Sec. 3.4): mean distance to the reference camera of the
+    GT depth points of all given views, expressed in that camera's frame."""
+    views = range(len(points_world)) if views is None else views
+    pts = np.concatenate([points_world[v] for v in views])
+    return float(np.linalg.norm(pts @ w2c_ref[:, :3].T + w2c_ref[:, 3], axis=1).mean())
+
+
 # --------------------------------------------------------------------------- point clouds
 
 def chamfer_metrics(pred: np.ndarray, gt: np.ndarray, taus=(0.01, 0.02, 0.05)) -> dict:

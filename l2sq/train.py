@@ -15,6 +15,10 @@ Evaluation uses fixed samples for N in {1,2,4,8} from the TRAIN views and from t
 (different cameras). Distances marked 'world' are multiplied back by s, i.e. in units of the
 object's radius (mesh scaled to the unit sphere), comparable with recon.eval_vggt.
 
+TensorBoard (<out>/tb): training losses, lr, s/step, and every eval metric with train and test
+views overlaid ("eval_all/..." averaged over N, "eval_N<n>/..." per N):
+    tensorboard --logdir runs --port 6006     (then forward the port like the viewer)
+
 Writes to --out: args.json, metrics.jsonl (one line per evaluation), decoder.pt,
 examples/<split>_N<n>_<k>/{gt_sq.ply, pred_sq.ply, sample.json} for the viewer:
     python -m recon.view --mesh runs/chair_L1/examples/test_N8_0/gt_sq.ply runs/chair_L1/examples/test_N8_0/pred_sq.ply
@@ -123,6 +127,15 @@ def export_examples(vggt, dec, pool, samples, split, P, device, folder: Path):
 
 # --------------------------------------------------------------------------- main
 
+def make_writer(logdir: Path):
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+    except ImportError:
+        print("tensorboard not installed (pip install tensorboard) -- logging to metrics.jsonl only", file=sys.stderr)
+        return None
+    return SummaryWriter(str(logdir))
+
+
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(prog="python -m l2sq.train", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -157,6 +170,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--examples", type=int, default=2, help="exported example meshes per N in {1,8} and split")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cuda")
+    p.add_argument("--no-tb", action="store_true", help="disable TensorBoard logging (<out>/tb)")
     a = p.parse_args(argv)
 
     if a.device == "cuda" and not torch.cuda.is_available():
@@ -188,6 +202,11 @@ def main(argv: list[str] | None = None) -> None:
 
     rng = np.random.default_rng(a.seed)
     metrics_f = open(out / "metrics.jsonl", "a")
+    tb = None if a.no_tb else make_writer(out / "tb")
+    # one writer per eval split: same tags -> TensorBoard overlays "eval_train" and "eval_test" in each chart
+    tb_eval = {split: make_writer(out / "tb" / f"eval_{split}") for split in ("train", "test")} if tb else {}
+    if tb is not None:
+        tb.add_text("args", "```\n" + json.dumps(vars(a), indent=2) + "\n```")
     running, t0 = {}, time.time()
     for step in range(1, a.steps + 1):
         n = int(rng.integers(a.n_min, a.n_max + 1))
@@ -204,8 +223,13 @@ def main(argv: list[str] | None = None) -> None:
             running[k] = running.get(k, 0.0) + v
         if step % a.log_every == 0:
             msg = "  ".join(f"{k} {v / a.log_every:.4g}" for k, v in running.items())
-            print(f"step {step:5d}  {msg}  lr {sched.get_last_lr()[0]:.2e}  "
-                  f"{(time.time() - t0) / a.log_every:.2f}s/step", file=sys.stderr)
+            sec = (time.time() - t0) / a.log_every
+            print(f"step {step:5d}  {msg}  lr {sched.get_last_lr()[0]:.2e}  {sec:.2f}s/step", file=sys.stderr)
+            if tb is not None:
+                for k, v in running.items():
+                    tb.add_scalar(f"train_loss/{k}", v / a.log_every, step)
+                tb.add_scalar("misc/lr", sched.get_last_lr()[0], step)
+                tb.add_scalar("misc/sec_per_step", sec, step)
             running, t0 = {}, time.time()
 
         if step % a.eval_every == 0 or step == a.steps:
@@ -214,6 +238,11 @@ def main(argv: list[str] | None = None) -> None:
                 res[split] = evaluate(vggt, dec, pool, samples, a.queries, a.batch, device, w)
             metrics_f.write(json.dumps(res) + "\n")
             metrics_f.flush()
+            for split, writer in tb_eval.items():
+                for key in ["all"] + [f"N{n}" for n in EVAL_NS]:
+                    for metric, value in res[split][key].items():
+                        writer.add_scalar(f"eval_{key}/{metric}", value, step)
+                writer.flush()
             for split in eval_sets:
                 r = res[split]["all"]
                 print(f"[eval {split:5s} step {step}] loss {r['loss']:.4f}  rot {r['rot_deg']:.1f}deg  "
@@ -235,6 +264,9 @@ def main(argv: list[str] | None = None) -> None:
             print(f"  {split:5s} N={n}: rot {r['rot_deg']:.1f}deg  t {r['t_err_world']:.4f}  "
                   f"scale {100 * r['scale_rel_err']:.1f}%  chamfer {r['chamfer_world']:.4f}  #SQ {r['n_pred']:.1f}",
                   file=sys.stderr)
+    for writer in [tb, *tb_eval.values()]:
+        if writer is not None:
+            writer.close()
     print(f"saved {out}", file=sys.stderr)
 
 
