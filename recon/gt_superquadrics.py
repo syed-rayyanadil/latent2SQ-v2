@@ -95,7 +95,11 @@ def load_model(ckpt_dir: Path, device: str):
         sys.exit(f"Checkpoint not found: {ckpt_path}\n"
                  "Download it (see superflex/scripts/download_checkpoints.sh).")
     cfg = OmegaConf.load(cfg_path)
-    model = SuperFlex(cfg.superflex).to(device)
+    # deformable checkpoints name the model section 'superflex'; the rigid 'base' one 'superdec'
+    model_cfg = cfg.get("superflex") or cfg.get("superdec")
+    if model_cfg is None:
+        sys.exit(f"{cfg_path} has neither a 'superflex' nor a 'superdec' section")
+    model = SuperFlex(model_cfg).to(device)
     state = torch.load(ckpt_path, map_location=device, weights_only=False)
     model.load_state_dict(state["model_state_dict"])
     return model.eval()
