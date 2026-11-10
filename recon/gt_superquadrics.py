@@ -18,6 +18,9 @@ Writes:
                 exist, tapering, bending, assign_matrix, pc  (load with PredictionHandler.from_npz)
     <out>.ply   superquadric mesh for viewing (one color per primitive)
 
+--rigid uses SuperFlex's 'base' checkpoint (no tapering/bending) and optimizes only the rigid
+parameters; tapering/bending are then stored as zeros.
+
 Superquadric pose convention (SuperFlex): x_frame = rotation @ x_local + translation.
 """
 
@@ -125,7 +128,8 @@ def occupancy_samples(mesh, n: int = N_IOU, seed: int = 0):
     return pts.astype(np.float32), np.asarray(occ, bool)
 
 
-def optimize(handler, surf: np.ndarray, pts_iou: np.ndarray, occ: np.ndarray, iters: int, device: str):
+def optimize(handler, surf: np.ndarray, pts_iou: np.ndarray, occ: np.ndarray, iters: int, device: str,
+             deform: bool = True):
     from omegaconf import OmegaConf
     from superflex.optimization import SuperQOptimization
 
@@ -135,7 +139,7 @@ def optimize(handler, surf: np.ndarray, pts_iou: np.ndarray, occ: np.ndarray, it
         "points": [torch.tensor(surf, dtype=torch.float32, device=device)],
     }
     sq = SuperQOptimization(pred_handler=handler, indices=[0], external_data=ext, device=device,
-                            cfg=OmegaConf.create({"tapering": True, "bending": True}))
+                            cfg=OmegaConf.create({"tapering": deform, "bending": deform}))
     opt = torch.optim.Adam(sq.get_param_groups())
     names = ["raw_scale", "raw_exponents", "raw_rotation", "raw_tapering", "raw_bending", "translation"]
 
@@ -189,8 +193,11 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--gt", required=True, help="gt.npz from dataset.sample_gt")
     p.add_argument("--cameras", required=True, help="cameras.json from dataset.render (mesh + frames)")
     p.add_argument("--out", required=True, help="output path without extension (writes .npz and .ply)")
-    p.add_argument("--ckpt", default=str(REPO / "superflex" / "checkpoints" / "superflex"),
-                   help="SuperFlex checkpoint folder with ckpt.pt + config.yaml")
+    p.add_argument("--rigid", action="store_true",
+                   help="rigid superquadrics only (no tapering/bending): 'base' checkpoint + rigid optimization")
+    p.add_argument("--ckpt", default=None,
+                   help="SuperFlex checkpoint folder with ckpt.pt + config.yaml "
+                        "(default: superflex/checkpoints/base with --rigid, else .../superflex)")
     p.add_argument("--optimize", type=int, default=1000, help="optimization iterations (0 = network only)")
     p.add_argument("--frame", choices=["same", "world", "cam0"], default="same",
                    help="output frame; 'same' = the GT file's frame")
@@ -216,7 +223,8 @@ def main(argv: list[str] | None = None) -> None:
     surf = fps(world_pts, N_SURF, device, a.seed)
 
     # 2. network prediction
-    model = load_model(Path(a.ckpt), device)
+    ckpt = Path(a.ckpt) if a.ckpt else REPO / "superflex" / "checkpoints" / ("base" if a.rigid else "superflex")
+    model = load_model(ckpt, device)
     name = Path(a.out).stem
     handler = predict(model, surf, device, name)
     n_prim = int((handler.exist[0] > 0.5).sum())
@@ -225,7 +233,7 @@ def main(argv: list[str] | None = None) -> None:
     # 3. optimization against the mesh
     if a.optimize > 0:
         pts_iou, occ = occupancy_samples(world_mesh(cams), seed=a.seed)
-        handler, iou = optimize(handler, surf, pts_iou, occ, a.optimize, device)
+        handler, iou = optimize(handler, surf, pts_iou, occ, a.optimize, device, deform=not a.rigid)
         print(f"Optimized {a.optimize} iterations, best IoU {iou:.3f}", file=sys.stderr)
 
     # 4. into the output frame and save

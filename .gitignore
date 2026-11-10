@@ -8,3 +8,6 @@ __pycache__/
 dataset/*/
 *.ply
 *.npz
+
+# training runs (checkpoints, metrics, example meshes)
+runs/

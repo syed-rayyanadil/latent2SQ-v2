@@ -7,6 +7,7 @@ latent2SQ/
 ├── dataset/          rendering, GT sampling          (python -m dataset.<script>)
 │   └── <name>/       per-object outputs (gitignored)
 ├── recon/            VGGT, SuperFlex, viewer         (python -m recon.<script>)
+├── l2sq/             SQ decoder on VGGT tokens       (python -m l2sq.train)
 ├── vggt/             submodule
 ├── superflex/        submodule
 ├── requirements.txt  our extra deps
@@ -87,7 +88,7 @@ python -m recon.gt_superquadrics --gt dataset/chair_test/gt.npz \
     --cameras dataset/chair_test/cameras.json --out dataset/chair_test/gt_sq
 ```
 → `gt_sq.npz` (SuperFlex format: scale, rotation, translation, exponents, tapering, bending, exist), `gt_sq.ply` (mesh, one color per primitive).
-Options: `--optimize 0` network only (default 1000 iterations), `--frame world`.
+Options: `--optimize 0` network only (default 1000 iterations), `--frame world`, `--rigid` (no tapering/bending, 'base' checkpoint).
 
 ### 5. Evaluate VGGT against the GT
 Aligns VGGT's cloud to the GT using the cameras, then reports camera and point-cloud errors.
@@ -109,6 +110,34 @@ ssh -p 58022 -L 8080:localhost:8080 hdo@atcremers66.in.tum.de
 ```
 VGGT's cloud is rescaled to the GT with the camera-based scale (same as step 5).
 Options: `--port 8091` if 8080 is taken, `--vggt-align none` to show VGGT at its raw scale.
+
+## Decoder sanity check (single object, MSE)
+
+Frozen VGGT tokens → SQ decoder (`l2sq/`, see `instructions/pipeline.JPG`). One object, 24 train views and 24 test views from different random cameras; GT superquadric *m* is tied to query *m*, so plain MSE is valid.
+
+```bash
+OBJ=dataset/chair
+MESH=$(ls ~/shapenet_partial_views/chair/*/mesh.npz | head -1)
+
+# views + depth (depth is needed for VGGT's per-sample scale normalization)
+python -m dataset.render --mesh "$MESH" --out $OBJ/train --n-views 24 --mode random --seed 0 --save-depth --save-mask
+python -m dataset.render --mesh "$MESH" --out $OBJ/test  --n-views 24 --mode random --seed 1 --save-depth --save-mask
+
+# rigid pseudo-GT in the world frame (SuperFlex 'base' checkpoint, once)
+gdown --folder 1yz4rwho0rsQGb5pEQcPIucZUjohOlfBN -O superflex/checkpoints/base
+python -m dataset.sample_gt --cameras $OBJ/train/cameras.json --frame world --out $OBJ/gt_world.ply
+python -m recon.gt_superquadrics --rigid --gt $OBJ/gt_world.npz --cameras $OBJ/train/cameras.json --out $OBJ/gt_sq_rigid
+
+# train (L = 1 decoder layer, P = 16 queries)
+python -m l2sq.train --train $OBJ/train --test $OBJ/test --gt-sq $OBJ/gt_sq_rigid.npz --out runs/chair_L1
+```
+Per sample: N ∈ [1, 8] random train views, the first is the reference. Targets = GT superquadrics moved into that camera's frame and divided by *s* = mean distance of the GT depth points of all N views to it (VGGT's normalization). Every `--eval-every` steps it evaluates fixed samples for N ∈ {1, 2, 4, 8} on train and test views: rotation error, translation error, scale error, Chamfer between superquadric surfaces (×*s*, object-radius units), existence accuracy, number of predicted superquadrics.
+
+→ `runs/chair_L1/`: `metrics.jsonl`, `eval_final.json`, `decoder.pt`, `examples/<split>_N<n>_<k>/{gt_sq,pred_sq}.ply`:
+```bash
+python -m recon.view --mesh runs/chair_L1/examples/test_N8_0/gt_sq.ply runs/chair_L1/examples/test_N8_0/pred_sq.ply
+```
+Options: `--layers 3`, `--queries 16`, `--steps 3000`, `--batch 2`, `--vggt-layer 23`, `--w-t/--w-R/--w-scale/--w-eps/--w-exist` loss weights.
 
 ### Download results to your laptop
 ```bash
