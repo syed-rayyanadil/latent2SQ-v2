@@ -67,8 +67,27 @@ def world_mesh(cams: dict):
 
 # --------------------------------------------------------------------------- SuperFlex
 
+def ensure_cuda_home() -> None:
+    """SuperFlex JIT-loads CUDA kernels (PVCNN); torch needs CUDA_HOME even when they are cached."""
+    import os
+    import shutil
+
+    if os.environ.get("CUDA_HOME"):
+        return
+    nvcc = shutil.which("nvcc")
+    if nvcc is None:
+        sys.exit("CUDA_HOME is not set and nvcc is not on PATH. SuperFlex compiles CUDA kernels; run e.g.\n"
+                 "    module load cuda/12.1\n"
+                 "    export CUDA_HOME=$(dirname $(dirname $(which nvcc)))\n"
+                 "(or add both lines to ~/.bashrc)")
+    os.environ["CUDA_HOME"] = str(Path(nvcc).resolve().parents[1])
+    print(f"CUDA_HOME not set, using {os.environ['CUDA_HOME']} (from nvcc)", file=sys.stderr)
+
+
 def load_model(ckpt_dir: Path, device: str):
     from omegaconf import OmegaConf
+
+    ensure_cuda_home()
     from superflex.superflex import SuperFlex
 
     ckpt_path, cfg_path = ckpt_dir / "ckpt.pt", ckpt_dir / "config.yaml"
