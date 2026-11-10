@@ -1,5 +1,5 @@
 # local-only files
-welcome.pdf
+instructions/
 .DS_Store
 __pycache__/
 *.pyc
