@@ -37,32 +37,46 @@ def list_images(folder: str | Path) -> list[str]:
 
 
 @torch.no_grad()
-def run_vggt(image_files: list[str], device: str = "cuda") -> dict:
-    from vggt.models.vggt import VGGT
+def run_vggt(image_files: list[str], device: str = "cuda", with_pointmap: bool = False,
+             chunk: int = 2) -> dict:
+    """VGGT forward, written out step by step to keep GPU memory low enough for 24+ views on 12 GB:
+    the dense heads run `chunk` frames at a time (upstream default 8, in fp32), and the point-map
+    head only when it is needed. Same computations and outputs as VGGT.forward otherwise."""
     from vggt.utils.load_fn import load_and_preprocess_images
     from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+
+    from recon.vggt_utils import load_vggt
 
     # bf16 on Ampere+ (your RTX A2000 supports it), fp16 otherwise
     dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
 
-    model = VGGT.from_pretrained("facebook/VGGT-1B").to(device).eval()  # first run downloads ~5 GB to $HF_HOME
-    images = load_and_preprocess_images(image_files).to(device)  # (S, 3, H, W) in [0, 1]
+    model = load_vggt().to(device).eval()
+    images = load_and_preprocess_images(image_files).to(device)[None]  # (1, S, 3, H, W) in [0, 1]
+    free, total = torch.cuda.mem_get_info()
+    print(f"GPU memory free before inference: {free / 1e9:.1f} / {total / 1e9:.1f} GB", file=sys.stderr)
 
     with torch.autocast("cuda", dtype=dtype):
-        pred = model(images)
-    extrinsic, intrinsic = pose_encoding_to_extri_intri(pred["pose_enc"], images.shape[-2:])
+        tokens, patch_start_idx = model.aggregator(images)
+    with torch.autocast("cuda", enabled=False):  # heads in fp32, as in VGGT.forward
+        pose_enc = model.camera_head(tokens)[-1]
+        depth, depth_conf = model.depth_head(tokens, images=images, patch_start_idx=patch_start_idx,
+                                             frames_chunk_size=chunk)
+        if with_pointmap:
+            world_points, world_points_conf = model.point_head(tokens, images=images, patch_start_idx=patch_start_idx,
+                                                               frames_chunk_size=chunk)
+    extrinsic, intrinsic = pose_encoding_to_extri_intri(pose_enc, images.shape[-2:])
 
     out = {
-        "images": images.float().cpu().numpy(),                     # (S, 3, H, W)
+        "images": images[0].float().cpu().numpy(),                  # (S, 3, H, W)
         "extrinsic": extrinsic[0].float().cpu().numpy(),            # (S, 3, 4) camera-from-world
         "intrinsic": intrinsic[0].float().cpu().numpy(),            # (S, 3, 3)
-        "depth": pred["depth"][0, ..., 0].float().cpu().numpy(),    # (S, H, W)
-        "depth_conf": pred["depth_conf"][0].float().cpu().numpy(),  # (S, H, W)
-        "world_points": pred["world_points"][0].float().cpu().numpy(),            # (S, H, W, 3)
-        "world_points_conf": pred["world_points_conf"][0].float().cpu().numpy(),  # (S, H, W)
+        "depth": depth[0, ..., 0].float().cpu().numpy(),            # (S, H, W)
+        "depth_conf": depth_conf[0].float().cpu().numpy(),          # (S, H, W)
     }
-    if device == "cuda":
-        print(f"peak GPU memory: {torch.cuda.max_memory_allocated() / 1e9:.1f} GB", file=sys.stderr)
+    if with_pointmap:
+        out["world_points"] = world_points[0].float().cpu().numpy()            # (S, H, W, 3)
+        out["world_points_conf"] = world_points_conf[0].float().cpu().numpy()  # (S, H, W)
+    print(f"peak GPU memory: {torch.cuda.max_memory_allocated() / 1e9:.1f} GB", file=sys.stderr)
     return out
 
 
@@ -94,6 +108,8 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--conf-percentile", type=float, default=50.0,
                    help="drop the lowest X%% confidence points (0 keeps all)")
     p.add_argument("--keep-white-bg", action="store_true", help="do not remove white background pixels")
+    p.add_argument("--chunk", type=int, default=2,
+                   help="frames per chunk in the dense heads (lower = less GPU memory; upstream default 8)")
     a = p.parse_args(argv)
 
     if not torch.cuda.is_available():
@@ -104,7 +120,7 @@ def main(argv: list[str] | None = None) -> None:
 
     files = list_images(a.images)
     print(f"Running VGGT on {len(files)} images from {a.images}", file=sys.stderr)
-    pred = run_vggt(files)
+    pred = run_vggt(files, with_pointmap=a.source == "pointmap", chunk=a.chunk)
 
     points, colors = build_pointcloud(pred, a.source, a.conf_percentile, not a.keep_white_bg)
     write_ply(out.with_suffix(".ply"), points, colors)

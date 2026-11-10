@@ -22,9 +22,9 @@ class FrozenVGGT(nn.Module):
 
     def __init__(self, layer: int = 23):
         super().__init__()
-        from vggt.models.vggt import VGGT
+        from recon.vggt_utils import load_vggt
 
-        vggt = VGGT.from_pretrained("facebook/VGGT-1B")
+        vggt = load_vggt()
         self.aggregator = vggt.aggregator
         del vggt
         self.aggregator.eval().requires_grad_(False)
