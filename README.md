@@ -89,7 +89,16 @@ python -m recon.gt_superquadrics --gt dataset/chair_test/gt.npz \
 → `gt_sq.npz` (SuperFlex format: scale, rotation, translation, exponents, tapering, bending, exist), `gt_sq.ply` (mesh, one color per primitive).
 Options: `--optimize 0` network only (default 1000 iterations), `--frame world`.
 
-### 5. Visualize
+### 5. Evaluate VGGT against the GT
+Aligns VGGT's cloud to the GT using the cameras, then reports camera and point-cloud errors.
+```bash
+python -m recon.eval_vggt dataset/chair_test
+```
+→ prints alignment, camera errors (rotation°, center, focal) and accuracy / completeness / Chamfer / F-score; writes `vggt_aligned.ply` (VGGT in the GT frame and scale) and `eval_vggt.json`.
+Options: `--align sim3` for full Umeyama (VGGT paper protocol), `--align none`.
+Distances are in units of the object's radius (mesh scaled to the unit sphere).
+
+### 6. Visualize
 Interactive viewer for superquadrics + point clouds in the browser; starts at rendered camera 0.
 ```bash
 python -m recon.view dataset/chair_test      # loads gt_sq.ply, gt.ply, vggt.ply if present
@@ -98,7 +107,8 @@ Open http://localhost:8080 on your laptop. VS Code Remote-SSH forwards the port 
 ```bash
 ssh -p 58022 -L 8080:localhost:8080 hdo@atcremers66.in.tum.de
 ```
-Options: `--port 8091` if 8080 is taken, `--vggt-scale none` to show VGGT at its raw scale.
+VGGT's cloud is rescaled to the GT with the camera-based scale (same as step 5).
+Options: `--port 8091` if 8080 is taken, `--vggt-align none` to show VGGT at its raw scale.
 
 ### Download results to your laptop
 ```bash
@@ -115,7 +125,7 @@ scp -P 58022 "hdo@atcremers66.in.tum.de:~/latent2SQ/dataset/chair_test/*.ply" ./
 | `world` | renderer, SuperFlex input | mesh centered and scaled to the unit sphere, y-up (ShapeNet orientation) |
 
 `w2c` in `cameras.json` maps world → camera (`x_cam = R x_world + t`), same as VGGT's predicted extrinsics.
-VGGT's cloud is in `cam0` but at an arbitrary scale, so align it (e.g. Umeyama) before computing metrics.
+VGGT's cloud is in `cam0` but at an arbitrary scale. VGGT fixes camera 0 at the identity, like our GT, so only the scale is unknown; `recon.eval_vggt` estimates it from the predicted vs GT camera centers (not from the points, whose coverage differs).
 Superquadric pose (SuperFlex): `x = rotation @ x_local + translation`.
 
 ## Notes

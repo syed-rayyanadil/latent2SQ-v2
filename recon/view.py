@@ -11,8 +11,8 @@ automatically; from a plain terminal use:
 
 Everything is shown in the frame it was saved in. For our files that is cam0 (OpenCV:
 y down, z forward), and the initial view is rendered camera 0, i.e. images/000.png.
-VGGT's cloud has an arbitrary scale; --vggt-scale auto rescales it about the camera
-center to the GT's size (a visual aid only, not an alignment for metrics).
+VGGT's cloud has an arbitrary scale; by default it is rescaled to the GT with the scale
+estimated from the cameras (same as recon.eval_vggt), see --vggt-align.
 """
 
 from __future__ import annotations
@@ -49,7 +49,9 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--port", type=int, default=8080)
     p.add_argument("--max-points", type=int, default=50_000, help="subsample each cloud for the browser")
     p.add_argument("--point-size", type=float, default=0.01)
-    p.add_argument("--vggt-scale", default="auto", help="'auto', 'none', or a number")
+    p.add_argument("--vggt-align", default="scale",
+                   help="how to place vggt.ply on the GT: 'scale' (from cameras, default), 'sim3' "
+                        "(Umeyama from cameras), 'none' (raw), or a number (manual scale)")
     a = p.parse_args(argv)
 
     meshes, pcs = [Path(m) for m in a.mesh], [Path(c) for c in a.pc]
@@ -65,19 +67,25 @@ def main(argv: list[str] | None = None) -> None:
     rng = np.random.default_rng(0)
     clouds = {path: load_pc(path, a.max_points, rng) for path in pcs}
 
-    # Rough scale for VGGT: match median distance from the camera (origin) to the GT's.
-    ref = next((c[0] for path, c in clouds.items() if path.stem.startswith("gt")), None)
+    # Place VGGT's cloud on the GT. Its scale is arbitrary; the alignment comes from the cameras
+    # (Umeyama on predicted vs GT camera centers, see recon/align.py), which needs
+    # cameras.json + vggt_pred.npz next to vggt.ply.
     for path, (pts, cols) in clouds.items():
-        if "vggt" not in path.stem or a.vggt_scale == "none":
+        if path.stem != "vggt" or a.vggt_align == "none":
             continue
-        if a.vggt_scale == "auto":
-            if ref is None:
+        try:
+            s, R, t = float(a.vggt_align), np.eye(3), np.zeros(3)
+            how = "manual scale"
+        except ValueError:
+            from recon.align import align_from_cameras, apply_sim3, load_case
+            if not ((path.parent / "cameras.json").exists() and (path.parent / "vggt_pred.npz").exists()):
+                print(f"{path.name}: no cameras.json / vggt_pred.npz next to it, shown unaligned", file=sys.stderr)
                 continue
-            s = float(np.median(np.linalg.norm(ref, axis=1)) / np.median(np.linalg.norm(pts, axis=1)))
-        else:
-            s = float(a.vggt_scale)
-        clouds[path] = (pts * s, cols)
-        print(f"{path.name}: scaled x{s:.3f} about the camera center", file=sys.stderr)
+            cams, pred = load_case(path.parent)
+            s, R, t = align_from_cameras(cams, pred["extrinsic"], a.vggt_align)
+            how = f"{a.vggt_align} from cameras"
+        clouds[path] = (apply_sim3(pts, s, R, t).astype(np.float32) if how != "manual scale" else pts * s, cols)
+        print(f"{path.name}: aligned ({how}), scale x{s:.3f}", file=sys.stderr)
 
     server = viser.ViserServer(port=a.port)
     server.scene.set_up_direction("-y")  # cam0 / OpenCV frame: y points down
