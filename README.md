@@ -148,6 +148,12 @@ python -m recon.view --mesh runs/chair_L1/examples/test_N8_0/gt_sq.ply runs/chai
 ```
 Options: `--layers 3`, `--queries 16`, `--steps 3000`, `--batch 2`, `--vggt-layer 23`, `--w-t/--w-R/--w-scale/--w-eps/--w-exist` loss weights, `--scale-loss log|linear` (default log: MSE on log(scale), i.e. relative size errors; `runs/chair_L1` used linear), `--no-tb`.
 
+**Deformable** (tapering + bending, branch `deformable`): train on `gt_sq_deform.npz` with `--deform`. The decoder then outputs 26 values per query (+ tapering 2, bending amount 3, bending direction 3×2D); extra losses `taper`, `bend`, `alpha` (weights `--w-taper`, `--w-bend`). Check first that our deformed surface matches SuperFlex's mesh (Chamfer ≈ 1e-3 or below):
+```bash
+python -m l2sq.sq $OBJ/gt_sq_deform.npz
+python -m l2sq.train --train $OBJ/train --test $OBJ/test --gt-sq $OBJ/gt_sq_deform.npz --deform --out runs/chair_L1_deform
+```
+
 **Predict on a split** with views 0…N−1 (reference = camera 0, so it lines up with the split viewer):
 ```bash
 python -m l2sq.predict runs/chair_L1_logscale dataset/chair/test -n 8 24

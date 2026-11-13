@@ -10,6 +10,15 @@ and surface points x = R @ x_local + t with
                s_y * fc(eta, e1) * fs(omega, e2),
                s_z * fs(eta, e1)),   eta in [-pi/2, pi/2], omega in [-pi, pi]
 where fc(a, e) = sign(cos a) |cos a|^e and fs(a, e) = sign(sin a) |sin a|^e.
+
+Deformable superquadrics (SuperFlex) also deform x_local before R, t:
+    tapering (2,)  kx, ky in [-1, 1]:  x *= 1 + kx z / s_z,  y *= 1 + ky z / s_z
+    bending        per axis in the order (z, x, y): curvature kb >= 0 (1/length) and direction
+                   angle alpha; applied around y, then x, then z (SuperFlex stores them interleaved
+                   as bending (6,) = [kb_z, a_z, kb_x, a_x, kb_y, a_y]).
+Here bending is stored as the dimensionless amount bend = kb * min_radius(scale, taper) in [0, 1]
+(SuperFlex's own parameterization, kb = sigmoid(raw) / min_radius), which does not change when
+the superquadric is rescaled -> no extra handling in to_view_frame.
 """
 
 from __future__ import annotations
@@ -71,22 +80,62 @@ def sq_grid(n_eta: int, n_omega: int, device=None) -> tuple[torch.Tensor, torch.
     return e.reshape(-1), o.reshape(-1)
 
 
-def sample_surface(scale, eps, R, t, n_eta: int = 16, n_omega: int = 32) -> torch.Tensor:
-    """Differentiable surface points. scale (...,3), eps (...,2), R (...,3,3), t (...,3) -> (..., K, 3)."""
+def min_radius(scale, taper):
+    """Smallest allowed bending radius per axis, in the bending order (z, x, y) (SuperFlex
+    SuperQOptimization._compute_min_radius). Works for numpy and torch. (...,3), (...,2) -> (...,3)."""
+    lib = torch if isinstance(scale, torch.Tensor) else np
+    sx = scale[..., 0] * (1 + abs(taper[..., 0]))
+    sy = scale[..., 1] * (1 + abs(taper[..., 1]))
+    sz = scale[..., 2]
+    thick = [lib.maximum(sy, sz), lib.maximum(sx, sz), lib.maximum(sx, sy)]      # x, y, z
+    loop = [sx / math.pi, sy / math.pi, sz / math.pi]
+    rx, ry, rz = (lib.maximum(a, b) for a, b in zip(thick, loop))
+    return lib.stack([rz, rx, ry], -1)
+
+
+def _bend_axis(x, y, z, kb, alpha, axis: str):
+    """SuperFlex bending around one axis (loss/utils.py parametric_to_points_extended)."""
+    u, v, w = {"z": (x, y, z), "x": (y, z, x), "y": (z, x, y)}[axis]
+    beta = torch.atan2(v, u)
+    r = torch.sqrt(u ** 2 + v ** 2 + 1e-12) * torch.cos(alpha - beta)
+    on = kb.abs() >= 1e-3
+    kb = torch.where(on, kb, torch.full_like(kb, 1e-3))
+    inv = 1.0 / kb
+    gamma = w * kb
+    rho = inv - r
+    d = inv - rho * torch.cos(gamma) - r
+    u2, v2, w2 = u + d * torch.cos(alpha), v + d * torch.sin(alpha), rho * torch.sin(gamma)
+    u, v, w = torch.where(on, u2, u), torch.where(on, v2, v), torch.where(on, w2, w)
+    return {"z": (u, v, w), "x": (w, u, v), "y": (v, w, u)}[axis]
+
+
+def sample_surface(scale, eps, R, t, n_eta: int = 16, n_omega: int = 32,
+                   taper=None, bend=None, alpha=None) -> torch.Tensor:
+    """Differentiable surface points. scale (...,3), eps (...,2), R (...,3,3), t (...,3) -> (..., K, 3).
+    Optional deformation: taper (...,2), bend (...,3) dimensionless, alpha (...,3), both in (z, x, y)."""
     eta, omega = sq_grid(n_eta, n_omega, scale.device)
     e1, e2 = eps[..., 0:1], eps[..., 1:2]                       # (..., 1)
     ce, se = _signed_pow(torch.cos(eta), e1), _signed_pow(torch.sin(eta), e1)
     co, so = _signed_pow(torch.cos(omega), e2), _signed_pow(torch.sin(omega), e2)
-    local = torch.stack([scale[..., 0:1] * ce * co, scale[..., 1:2] * ce * so, scale[..., 2:3] * se], -1)
+    x, y, z = scale[..., 0:1] * ce * co, scale[..., 1:2] * ce * so, scale[..., 2:3] * se
+    if taper is not None:
+        zn = z / scale[..., 2:3]
+        x, y = x * (1 + taper[..., 0:1] * zn), y * (1 + taper[..., 1:2] * zn)
+    if bend is not None:
+        kb = bend / min_radius(scale, taper if taper is not None else torch.zeros_like(scale[..., :2]))
+        for ch, axis in [(2, "y"), (1, "x"), (0, "z")]:
+            x, y, z = _bend_axis(x, y, z, kb[..., ch:ch + 1], alpha[..., ch:ch + 1], axis)
+    local = torch.stack([x, y, z], -1)
     return local @ R.transpose(-1, -2) + t.unsqueeze(-2)
 
 
-def sq_mesh(scale, eps, R, t, colors=None, n_eta: int = 24, n_omega: int = 48):
+def sq_mesh(scale, eps, R, t, colors=None, n_eta: int = 24, n_omega: int = 48, taper=None, bend=None, alpha=None):
     """trimesh mesh of a set of superquadrics (numpy or torch inputs, leading dim = primitives)."""
     import trimesh
 
-    to_t = lambda a: torch.as_tensor(np.asarray(a), dtype=torch.float32)
-    pts = sample_surface(to_t(scale), to_t(eps), to_t(R), to_t(t), n_eta, n_omega).numpy()  # (M, K, 3)
+    to_t = lambda a: None if a is None else torch.as_tensor(np.asarray(a), dtype=torch.float32)
+    pts = sample_surface(to_t(scale), to_t(eps), to_t(R), to_t(t), n_eta, n_omega,
+                         to_t(taper), to_t(bend), to_t(alpha)).numpy()  # (M, K, 3)
     i, j = np.meshgrid(np.arange(n_eta - 1), np.arange(n_omega - 1), indexing="ij")
     a, b = i * n_omega + j, i * n_omega + j + 1
     c, d = (i + 1) * n_omega + j, (i + 1) * n_omega + j + 1
@@ -113,3 +162,23 @@ def chamfer(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """Symmetric L2 Chamfer (mean of the two mean nearest-neighbour distances). a (K,3), b (L,3)."""
     d = torch.cdist(a, b)
     return 0.5 * (d.min(1).values.mean() + d.min(0).values.mean())
+
+
+if __name__ == "__main__":
+    # Check: our surface of a SuperFlex fit vs SuperFlex's own mesh of it (.ply next to the .npz).
+    #   python -m l2sq.sq dataset/chair/gt_sq_deform.npz      -> Chamfer should be ~1e-3 or below
+    import sys
+    from pathlib import Path
+
+    import trimesh
+
+    from l2sq.data import GTSuperquadrics
+
+    path = Path(sys.argv[1])
+    gt = GTSuperquadrics(path, deform=True)
+    ours = sq_mesh(gt.scale, gt.eps, gt.R, gt.t, n_eta=48, n_omega=96, taper=gt.taper, bend=gt.bend, alpha=gt.alpha)
+    ref = trimesh.load(str(path.with_suffix(".ply")), process=False, force="mesh")
+    a = torch.as_tensor(trimesh.sample.sample_surface(ours, 20000, seed=0)[0], dtype=torch.float32)
+    b = torch.as_tensor(trimesh.sample.sample_surface(ref, 20000, seed=0)[0], dtype=torch.float32)
+    print(f"{len(gt)} superquadrics, max bend {gt.bend.max():.3f}, max |taper| {np.abs(gt.taper).max():.3f}; "
+          f"Chamfer(ours, SuperFlex mesh) = {float(chamfer(a, b)):.5f}")

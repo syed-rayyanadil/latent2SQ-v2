@@ -24,7 +24,7 @@ import torch
 
 from l2sq.data import GTSuperquadrics, ViewPool, make_sample
 from l2sq.model import FrozenVGGT, SQDecoder
-from l2sq.train import evaluate, export_examples
+from l2sq.train import evaluate, export_examples, loss_weights
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -40,14 +40,15 @@ def main(argv: list[str] | None = None) -> None:
     run, split = Path(a.run), Path(a.split)
     ckpt = torch.load(run / "decoder.pt", map_location="cpu")
     args = ckpt["args"]
-    dec = SQDecoder(args["d_model"], args["queries"], args["layers"], args["heads"], args["ffn"])
+    deform = args.get("deform", False)
+    dec = SQDecoder(args["d_model"], args["queries"], args["layers"], args["heads"], args["ffn"], deform=deform)
     dec.load_state_dict(ckpt["decoder"])
     dec.to(a.device).eval()
     vggt = FrozenVGGT(args["vggt_layer"]).to(a.device)
 
     pool = ViewPool(split)
-    gt = GTSuperquadrics(a.gt_sq or args["gt_sq"])
-    w = {"t": args["w_t"], "R": args["w_R"], "scale": args["w_scale"], "eps": args["w_eps"], "exist": args["w_exist"]}
+    gt = GTSuperquadrics(a.gt_sq or args["gt_sq"], deform=deform)
+    w = loss_weights(args)
     out_dir = run / "predict"
     print(f"decoder from {run} (step {ckpt['step']}), trained on N in [{args['n_min']}, {args['n_max']}]",
           file=sys.stderr)

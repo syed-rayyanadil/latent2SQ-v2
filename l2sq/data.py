@@ -17,7 +17,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from l2sq.sq import to_view_frame
+from l2sq.sq import min_radius, to_view_frame
 from recon.align import depth_points_world, vggt_normalization
 
 
@@ -29,6 +29,9 @@ class Sample:
     t: np.ndarray             # (M,3)
     scale: np.ndarray         # (M,3)
     eps: np.ndarray           # (M,2)
+    taper: np.ndarray | None = None   # (M,2)   deformable only (scale-free, unchanged by the frame change)
+    bend: np.ndarray | None = None    # (M,3)   bending amount kb * min_radius, axes (z, x, y)
+    alpha: np.ndarray | None = None   # (M,3)   bending direction angles, axes (z, x, y)
 
 
 class ViewPool:
@@ -57,16 +60,27 @@ class ViewPool:
 
 
 class GTSuperquadrics:
-    """Pseudo-GT superquadrics in the render WORLD frame (recon.gt_superquadrics --frame world)."""
+    """Pseudo-GT superquadrics in the render WORLD frame (recon.gt_superquadrics --frame world).
 
-    def __init__(self, path: str | Path):
+    deform=False: rigid only (a fit with tapering/bending is rejected).
+    deform=True:  also tapering and bending (SuperFlex bending (6,) -> bend amount + angle per axis).
+    """
+
+    def __init__(self, path: str | Path, deform: bool = False):
         d = np.load(path, allow_pickle=True)
         keep = (d["exist"][0] > 0.5).reshape(-1)
         self.R, self.t = d["rotation"][0][keep], d["translation"][0][keep]
         self.scale, self.eps = d["scale"][0][keep], d["exponents"][0][keep]
-        if np.abs(d["tapering"][0][keep]).max(initial=0) > 1e-6 or np.abs(d["bending"][0][keep][:, 0::2]).max(initial=0) > 1e-6:
-            raise ValueError(f"{path} has tapering/bending; the decoder predicts rigid superquadrics "
-                             "(re-fit with recon.gt_superquadrics --rigid)")
+        taper, bending = d["tapering"][0][keep].reshape(-1, 2), d["bending"][0][keep].reshape(-1, 6)
+        self.deform = deform
+        self.taper = self.bend = self.alpha = None
+        if deform:
+            self.taper = taper.astype(np.float64)
+            self.bend = np.clip(bending[:, 0::2] * min_radius(self.scale, self.taper), 0.0, 1.0)
+            self.alpha = bending[:, 1::2].astype(np.float64)
+        elif np.abs(taper).max(initial=0) > 1e-6 or np.abs(bending[:, 0::2]).max(initial=0) > 1e-6:
+            raise ValueError(f"{path} has tapering/bending; train with --deform, or use a rigid fit "
+                             "(recon.gt_superquadrics --rigid)")
 
     def __len__(self) -> int:
         return len(self.R)
@@ -75,6 +89,8 @@ class GTSuperquadrics:
 def make_sample(pool: ViewPool, gt: GTSuperquadrics, views: list[int]) -> Sample:
     s = pool.normalization(views)
     R, t, scale = to_view_frame(gt.R, gt.t, gt.scale, pool.w2c[views[0]], s)
+    if gt.deform:
+        return Sample(views, s, R, t, scale, gt.eps.copy(), gt.taper.copy(), gt.bend.copy(), gt.alpha.copy())
     return Sample(views, s, R, t, scale, gt.eps.copy())
 
 
@@ -95,10 +111,16 @@ def collate(pool: ViewPool, samples: list[Sample], P: int, device) -> dict:
         "exist": torch.zeros(B, P),
         "s": torch.tensor([s.scale_s for s in samples]),
     }
+    deform = samples[0].taper is not None
+    if deform:
+        out.update(taper=torch.zeros(B, P, 2), bend=torch.zeros(B, P, 3), alpha=torch.zeros(B, P, 3))
     for b, s in enumerate(samples):
         out["R"][b, :M] = torch.as_tensor(s.R, dtype=torch.float32)
         out["t"][b, :M] = torch.as_tensor(s.t, dtype=torch.float32)
         out["scale"][b, :M] = torch.as_tensor(s.scale, dtype=torch.float32)
         out["eps"][b, :M] = torch.as_tensor(s.eps, dtype=torch.float32)
         out["exist"][b, :M] = 1.0
+        if deform:
+            for k in ("taper", "bend", "alpha"):
+                out[k][b, :M] = torch.as_tensor(getattr(s, k), dtype=torch.float32)
     return {k: (v.to(device) if k != "images" else v) for k, v in out.items()}

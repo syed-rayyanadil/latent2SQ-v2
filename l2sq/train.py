@@ -8,7 +8,7 @@ Run from the repo root:
 Each batch draws one N in [n_min, n_max]; each sample draws N distinct views from the TRAIN pool,
 the first being the reference. Targets are the pseudo-GT superquadrics in that sample's VGGT
 frame (l2sq/data.py). Loss: MSE on translation, rotation matrix, log(scale) (--scale-loss),
-exponents for the GT slots (GT superquadric m <-> query m, a fixed assignment that is valid for a single object)
+exponents (--deform: + tapering, bending amount, bending direction) for the GT slots (GT superquadric m <-> query m, a fixed assignment that is valid for a single object)
 + BCE on existence for all P queries.
 
 Evaluation uses fixed samples for N in {1,2,4,8} from the TRAIN views and from the TEST views
@@ -63,8 +63,22 @@ def mse_loss(pred: dict, tgt: dict, w: dict, scale_loss: str = "log") -> tuple[t
         "eps": masked(pred["eps"], tgt["eps"]),
         "exist": F.binary_cross_entropy_with_logits(pred["exist_logit"], m),
     }
+    if "taper" in tgt:
+        parts["taper"] = masked(pred["taper"], tgt["taper"])
+        parts["bend"] = masked(pred["bend"], tgt["bend"])
+        # direction as a unit 2D vector, weighted by the target bending amount (meaningless when unbent)
+        tvec = torch.stack([tgt["alpha"].sin(), tgt["alpha"].cos()], -1)            # (B,P,3,2)
+        d2 = ((pred["alpha_vec"] - tvec) ** 2).sum(-1) * tgt["bend"]               # (B,P,3)
+        parts["alpha"] = (d2.mean(-1) * m).sum() / n
     total = sum(w[k] * v for k, v in parts.items())
     return total, {k: v.item() for k, v in parts.items()}
+
+
+def loss_weights(args: dict) -> dict:
+    w = {"t": args["w_t"], "R": args["w_R"], "scale": args["w_scale"], "eps": args["w_eps"], "exist": args["w_exist"]}
+    if args.get("deform"):
+        w.update(taper=args["w_taper"], bend=args["w_bend"], alpha=args["w_bend"])
+    return w
 
 
 # --------------------------------------------------------------------------- evaluation
@@ -74,6 +88,13 @@ def eval_samples(pool, gt, ns, per_n, seed):
     return {n: [make_sample(pool, gt, random_views(rng, len(pool), n)) for _ in range(per_n)] for n in ns}
 
 
+def sq_args(d: dict, b: int, sel, s: float = 1.0) -> tuple:
+    """(scale, eps, R, t, n_eta, n_omega, taper, bend, alpha) of sample b, slots sel, for
+    sample_surface; lengths multiplied by s (bend is scale-free)."""
+    deform = [d[k][b][sel] for k in ("taper", "bend", "alpha")] if "taper" in d else [None] * 3
+    return (d["scale"][b][sel] * s, d["eps"][b][sel], d["R"][b][sel], d["t"][b][sel] * s, 16, 32, *deform)
+
+
 @torch.no_grad()
 def evaluate(vggt, dec, pool, samples_by_n, P, batch, device, w, scale_loss="log") -> dict:
     dec.eval()
@@ -81,6 +102,8 @@ def evaluate(vggt, dec, pool, samples_by_n, P, batch, device, w, scale_loss="log
     for n, samples in samples_by_n.items():
         acc = {k: [] for k in ["loss", "rot_deg", "t_err_world", "scale_rel_err", "eps_err",
                                "exist_acc", "n_pred", "chamfer_world"]}
+        if dec.deform:
+            acc.update(taper_err=[], bend_err=[])
         for i in range(0, len(samples), batch):
             chunk = samples[i:i + batch]
             tgt = collate(pool, chunk, P, device)
@@ -93,13 +116,16 @@ def evaluate(vggt, dec, pool, samples_by_n, P, batch, device, w, scale_loss="log
             acc["t_err_world"] += ((pred["t"] - tgt["t"]).norm(dim=-1) * s)[m].tolist()
             acc["scale_rel_err"] += ((pred["scale"] - tgt["scale"]).abs() / tgt["scale"]).mean(-1)[m].tolist()
             acc["eps_err"] += (pred["eps"] - tgt["eps"]).abs().mean(-1)[m].tolist()
+            if dec.deform:
+                acc["taper_err"] += (pred["taper"] - tgt["taper"]).abs().mean(-1)[m].tolist()
+                acc["bend_err"] += (pred["bend"] - tgt["bend"]).abs().mean(-1)[m].tolist()
             exist_pred = torch.sigmoid(pred["exist_logit"]) > 0.5
             acc["exist_acc"] += (exist_pred == m).float().mean(-1).tolist()
             acc["n_pred"] += exist_pred.sum(-1).float().tolist()
             for b in range(len(chunk)):
                 keep = exist_pred[b] if exist_pred[b].any() else m[b]
-                p_pts = sample_surface(pred["scale"][b][keep], pred["eps"][b][keep], pred["R"][b][keep], pred["t"][b][keep]).reshape(-1, 3)
-                g_pts = sample_surface(tgt["scale"][b][m[b]], tgt["eps"][b][m[b]], tgt["R"][b][m[b]], tgt["t"][b][m[b]]).reshape(-1, 3)
+                p_pts = sample_surface(*sq_args(pred, b, keep)).reshape(-1, 3)
+                g_pts = sample_surface(*sq_args(tgt, b, m[b])).reshape(-1, 3)
                 acc["chamfer_world"].append(float(chamfer(p_pts, g_pts) * tgt["s"][b]))
         out[f"N{n}"] = {k: float(np.mean(v)) for k, v in acc.items()}
     out["all"] = {k: float(np.mean([out[f"N{n}"][k] for n in samples_by_n])) for k in next(iter(out.values()))}
@@ -112,19 +138,22 @@ def export_examples(vggt, dec, pool, samples, split, P, device, folder: Path):
     dec.eval()
     for k, smp in enumerate(samples):
         tgt = collate(pool, [smp], P, device)
-        pred = {key: v[0].cpu() for key, v in dec(vggt(tgt["images"])).items()}
+        pred = {key: v.cpu() for key, v in dec(vggt(tgt["images"])).items()}
+        tgt = {key: (v.cpu() if isinstance(v, torch.Tensor) else v) for key, v in tgt.items()}
         s = smp.scale_s
         d = folder / f"{split}_N{len(smp.views)}_{k}"
         d.mkdir(parents=True, exist_ok=True)
-        keep = torch.sigmoid(pred["exist_logit"]) > 0.5
+        keep = torch.sigmoid(pred["exist_logit"][0]) > 0.5
         if not keep.any():
             keep[:] = True
+        gt_slots = tgt["exist"][0] > 0.5
         # metric (world units) in the reference camera's frame -> recon.view starts at this camera
-        sq_mesh(smp.scale * s, smp.eps, smp.R, smp.t * s).export(d / "gt_sq.ply")
-        sq_mesh(pred["scale"][keep] * s, pred["eps"][keep], pred["R"][keep], pred["t"][keep] * s).export(d / "pred_sq.ply")
+        for name, d_, sel in [("gt_sq.ply", tgt, gt_slots), ("pred_sq.ply", pred, keep)]:
+            sc, ep, R, t, _, _, ta, be, al = sq_args(d_, 0, sel, s)
+            sq_mesh(sc, ep, R, t, taper=ta, bend=be, alpha=al).export(d / name)
         (d / "sample.json").write_text(json.dumps({
             "split": split, "views": smp.views, "images": [f"images/{v:03d}.png" for v in smp.views],
-            "pool": str(pool.folder), "s": s, "n_pred": int(keep.sum())}, indent=2))
+            "pool": str(pool.folder), "s": s, "n_pred": int(keep.sum()), "deform": dec.deform}, indent=2))
     dec.train()
 
 
@@ -166,6 +195,10 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--w-scale", type=float, default=1.0)
     p.add_argument("--w-eps", type=float, default=1.0)
     p.add_argument("--w-exist", type=float, default=1.0)
+    p.add_argument("--w-taper", type=float, default=1.0, help="--deform only")
+    p.add_argument("--w-bend", type=float, default=1.0, help="--deform only: bending amount and direction")
+    p.add_argument("--deform", action="store_true",
+                   help="deformable superquadrics: GT fit with tapering/bending (gt_sq_deform.npz), 26 outputs per query")
     p.add_argument("--scale-loss", choices=["log", "linear"], default="log",
                    help="MSE on log(scale) (relative errors, default) or on scale (runs/chair_L1 used linear)")
     # logging / eval
@@ -186,11 +219,11 @@ def main(argv: list[str] | None = None) -> None:
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     (out / "args.json").write_text(json.dumps(vars(a), indent=2))
-    w = {"t": a.w_t, "R": a.w_R, "scale": a.w_scale, "eps": a.w_eps, "exist": a.w_exist}
+    w = loss_weights(vars(a))
 
     print("loading views and pseudo-GT ...", file=sys.stderr)
     train_pool, test_pool = ViewPool(a.train), ViewPool(a.test)
-    gt = GTSuperquadrics(a.gt_sq)
+    gt = GTSuperquadrics(a.gt_sq, deform=a.deform)
     print(f"train views {len(train_pool)}, test views {len(test_pool)}, GT superquadrics {len(gt)}, P={a.queries}",
           file=sys.stderr)
     eval_sets = {
@@ -199,7 +232,7 @@ def main(argv: list[str] | None = None) -> None:
     }
 
     vggt = FrozenVGGT(a.vggt_layer).to(device)
-    dec = SQDecoder(a.d_model, a.queries, a.layers, a.heads, a.ffn).to(device)
+    dec = SQDecoder(a.d_model, a.queries, a.layers, a.heads, a.ffn, deform=a.deform).to(device)
     print(f"decoder parameters: {sum(p.numel() for p in dec.parameters()) / 1e6:.2f} M", file=sys.stderr)
     opt = torch.optim.AdamW(dec.parameters(), lr=a.lr, weight_decay=a.weight_decay)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda i: min(1.0, (i + 1) / a.warmup) *
