@@ -8,7 +8,7 @@ Run from the repo root:
 Rows, all compared with <obj>/gt_world.npz in the world frame with the same metric as
 recon.eval_vggt (accuracy = pred->GT, completeness = GT->pred, Chamfer = their mean, F-scores):
     gt_sq_rigid      the pseudo-GT the decoder is trained on -> ceiling for the MSE decoder
-    gt_sq            the deformable fit, if present          -> ceiling with tapering/bending
+    gt_sq_deform     the deformable fit (tapering + bending)  -> ceiling for a deformable decoder
     vggt <split>     <split>/vggt_aligned.ply (run recon.eval_vggt first), moved cam0 -> world
     pred/target ...  with --run: <run>/examples/*/{pred_sq,gt_sq}.ply, moved from the sample's
                      reference camera to world (target rows should reproduce gt_sq_rigid)
@@ -32,7 +32,7 @@ import trimesh
 
 from recon.align import chamfer_metrics, read_ply_xyz_rgb
 
-SQ_ROWS = ["gt_sq_rigid", "gt_sq"]
+SQ_ROWS = ["gt_sq_rigid", "gt_sq_deform", "gt_sq"]
 
 
 def mesh_points(path: Path, n: int, seed: int) -> np.ndarray:

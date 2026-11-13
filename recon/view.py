@@ -2,8 +2,8 @@
 
 Run on the server from the repo root:
 
-    python -m recon.view dataset/chair/train   # split folder: gt.ply, vggt.ply + ../gt_sq_rigid.ply, in this split's cam0
-    python -m recon.view dataset/chair         # object folder: gt_sq_rigid.ply + gt_world.ply, in the world frame
+    python -m recon.view dataset/chair/train   # split folder: gt.ply, vggt.ply + ../gt_sq_{rigid,deform}.ply, in this split's cam0
+    python -m recon.view dataset/chair         # object folder: gt_sq_{rigid,deform}.ply + gt_world.ply, world frame
     python -m recon.view --mesh a.ply --pc b.ply c.ply   # explicit files, shown as saved
 
 then open the printed URL (http://localhost:<port>) on your Mac. VS Code Remote-SSH forwards
@@ -30,7 +30,7 @@ from pathlib import Path
 import numpy as np
 import trimesh
 
-SQ_NAMES = ["gt_sq_rigid.ply", "gt_sq.ply"]   # world-frame superquadrics in the object folder
+SQ_NAMES = ["gt_sq_rigid.ply", "gt_sq_deform.ply", "gt_sq.ply"]   # world-frame SQs in the object folder (all shown)
 SPLIT_PCS = ["gt.ply", "vggt.ply"]            # cam0-frame clouds in a split folder
 OBJECT_PCS = ["gt_world.ply"]                 # world-frame cloud in the object folder
 
@@ -52,12 +52,10 @@ def collect(folder: Path):
         cams = json.loads((folder / "cameras.json").read_text())
         T = np.eye(4)
         T[:3] = np.asarray(cams["frames"][0]["w2c"])   # world -> cam0 (rigid, metric)
-        sq = next((folder.parent / n for n in SQ_NAMES if (folder.parent / n).exists()), None)
-        meshes = [(sq, T)] if sq else []
+        meshes = [(folder.parent / n, T) for n in SQ_NAMES if (folder.parent / n).exists()]
         pcs = [folder / f for f in SPLIT_PCS if (folder / f).exists()]
         return meshes, pcs, "cam0"
-    sq = next((folder / n for n in SQ_NAMES if (folder / n).exists()), None)
-    meshes = [(sq, None)] if sq else []
+    meshes = [(folder / n, None) for n in SQ_NAMES if (folder / n).exists()]
     pcs = [folder / f for f in OBJECT_PCS if (folder / f).exists()]
     return meshes, pcs, "world"
 
@@ -85,7 +83,7 @@ def main(argv: list[str] | None = None) -> None:
         pcs += c
     if not meshes and not pcs:
         p.error(f"nothing to show in {a.folder}: expected {SPLIT_PCS} (split folder) or "
-                f"{SQ_NAMES[0]} / {OBJECT_PCS} (object folder), or give --mesh/--pc files")
+                f"{SQ_NAMES[:2]} / {OBJECT_PCS} (object folder), or give --mesh/--pc files")
 
     import viser  # imported late so --help works without it
 

@@ -127,6 +127,8 @@ python -m dataset.render --mesh "$MESH" --out $OBJ/test  --n-views 24 --mode ran
 gdown --folder 1yz4rwho0rsQGb5pEQcPIucZUjohOlfBN -O superflex/checkpoints/base
 python -m dataset.sample_gt --cameras $OBJ/train/cameras.json --frame world --out $OBJ/gt_world.ply
 python -m recon.gt_superquadrics --rigid --gt $OBJ/gt_world.npz --cameras $OBJ/train/cameras.json --out $OBJ/gt_sq_rigid
+# deformable pseudo-GT (tapering + bending, 'superflex' checkpoint)
+python -m recon.gt_superquadrics --gt $OBJ/gt_world.npz --cameras $OBJ/train/cameras.json --out $OBJ/gt_sq_deform
 
 # sanity check: VGGT on all 24 views of each split (expect scale ratio ~1, Chamfer ~0.01)
 for SPLIT in train test; do
