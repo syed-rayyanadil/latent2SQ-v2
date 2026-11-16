@@ -178,6 +178,11 @@ Loss (all MSE over the GT slots, weights `--w-*`, default 1): `t`, `R` (3×3 mat
 
 Weights default to SuperFlex's `configs/train.yaml`: `--w-iou 0.2 --w-sdf 0.2 --w-overlap 5 --w-sparsity 1.26 --w-exist-sf 0.02`. Distances are computed after normalizing each sample as SuperFlex normalizes its input (centered, object in a unit cube), so these hyperparameters keep their meaning. One deviation: SuperFlex weights `sdf` with a learned point-to-primitive assignment from its point encoder; our decoder sees images, not points, so `sdf` uses the distance to the union (soft minimum over primitives, as SuperFlex's test-time optimization does), and sparsity/existence use the same soft assignment. `--w-mse 1` adds the parameter MSE (needs fixed slots) as extra supervision.
 
+Loss check without the network (`l2sq.check_loss`): optimizes superquadric parameters directly with this loss in one real sample frame, from the pseudo-GT (must stay ~0.94 IoU), the perturbed pseudo-GT (must recover) and an `--init` decoder's prediction (must improve):
+```bash
+python -m l2sq.check_loss --train $OBJ/train --gt-sq $OBJ/gt_sq_rigid.npz --init runs/chair_L1_logscale/decoder.pt
+```
+
 Existence (`--exist-mode`): `hard` (default) = only the currently existing primitives (p > 0.5) enter IoU / SDF / sparsity, and existence is trained only by `exist_sf` with targets computed among them, so parts can switch off but not on, as in SuperFlex's test-time optimization. `soft` = SuperFlex's training loss (existence-weighted union). Soft fails from an MSE warm start: the queries the MSE decoder keeps off have untrained, arbitrary geometry; in the soft union every one of them adds a little occupancy everywhere it covers, which alone pulled the starting IoU of a near-perfect decoder down to ~0.14, and the run diverged within 100 steps (all 16 queries on, then IoU ≈ 0; tried 2026-11-16).
 These losses are local: they refine parts that already roughly overlap the object, but give no gradient when the parts are far away (SDF saturates at the truncation, the soft occupancy at τ = 1e-3 is flat). From a random init the decoder collapses (IoU ≈ 0, all parts switched off; tried 2026-11-16). SuperFlex itself starts from SuperDec's trained checkpoint, so we warm-start from an MSE run with `--init` and fine-tune at a lower learning rate:
 ```bash
