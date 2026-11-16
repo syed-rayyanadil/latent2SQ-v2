@@ -177,9 +177,12 @@ Loss (all MSE over the GT slots, weights `--w-*`, default 1): `t`, `R` (3×3 mat
 - `overlap` (volume inside more than one primitive), `sparsity` (0.5-norm of primitive usage), `exist_sf` (BCE, target = primitive is closest for > 24 of 4096 surface points)
 
 Weights default to SuperFlex's `configs/train.yaml`: `--w-iou 0.2 --w-sdf 0.2 --w-overlap 5 --w-sparsity 1.26 --w-exist-sf 0.02`. Distances are computed after normalizing each sample as SuperFlex normalizes its input (centered, object in a unit cube), so these hyperparameters keep their meaning. One deviation: SuperFlex weights `sdf` with a learned point-to-primitive assignment from its point encoder; our decoder sees images, not points, so `sdf` uses the distance to the union (soft minimum over primitives, as SuperFlex's test-time optimization does), and sparsity/existence use the same soft assignment. `--w-mse 1` adds the parameter MSE (needs fixed slots) as extra supervision.
+These losses are local: they refine parts that already roughly overlap the object, but give no gradient when the parts are far away (SDF saturates at the truncation, the soft occupancy at τ = 1e-3 is flat). From a random init the decoder collapses (IoU ≈ 0, all parts switched off; tried 2026-11-16). SuperFlex itself starts from SuperDec's trained checkpoint, so we warm-start from an MSE run with `--init` and fine-tune at a lower learning rate:
 ```bash
-python -m l2sq.train --train $OBJ/train --test $OBJ/test --gt-sq $OBJ/gt_sq_rigid.npz --loss superflex --out runs/chair_L1_sf
-python -m l2sq.train --train $OBJ/train --test $OBJ/test --gt-sq $OBJ/gt_sq_deform.npz --deform --loss superflex --out runs/chair_L1_deform_sf
+python -m l2sq.train --train $OBJ/train --test $OBJ/test --gt-sq $OBJ/gt_sq_rigid.npz --loss superflex \
+    --init runs/chair_L1_logscale/decoder.pt --lr 1e-4 --out runs/chair_L1_sf
+python -m l2sq.train --train $OBJ/train --test $OBJ/test --gt-sq $OBJ/gt_sq_deform.npz --deform --loss superflex \
+    --init runs/chair_L1_deform/decoder.pt --lr 1e-4 --out runs/chair_L1_deform_sf
 ```
 (`--gt-sq` is still read: for the parameter metrics and `--w-mse`.)
 

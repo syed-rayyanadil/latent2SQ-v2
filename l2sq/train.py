@@ -243,6 +243,8 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--neg-slope", type=float, default=0.1, help="SDF weight omega for points inside")
     p.add_argument("--n-surf", type=int, default=4096, help="GT surface points per sample")
     p.add_argument("--n-vol", type=int, default=32768, help="GT volume (occupancy) points per sample")
+    p.add_argument("--init", help="start from a trained decoder.pt (same --deform, layers, ...), e.g. an MSE run; "
+                        "--loss superflex needs this: its losses are local and give no gradient from a random init")
     p.add_argument("--gt-world", help="GT surface points, world frame (default: <train>/../gt_world.npz)")
     p.add_argument("--scale-loss", choices=["log", "linear"], default="log",
                    help="MSE on log(scale) (relative errors, default) or on scale (runs/chair_L1 used linear)")
@@ -284,6 +286,16 @@ def main(argv: list[str] | None = None) -> None:
     vggt = FrozenVGGT(a.vggt_layer).to(device)
     dec = SQDecoder(a.d_model, a.queries, a.layers, a.heads, a.ffn, deform=a.deform).to(device)
     print(f"decoder parameters: {sum(p.numel() for p in dec.parameters()) / 1e6:.2f} M", file=sys.stderr)
+    if a.init:
+        ckpt = torch.load(a.init, map_location="cpu")
+        for k in ("d_model", "queries", "layers", "heads", "ffn", "vggt_layer", "deform"):
+            if ckpt["args"].get(k, False) != getattr(a, k):
+                sys.exit(f"--init {a.init}: {k} = {ckpt['args'].get(k, False)} there, {getattr(a, k)} here")
+        dec.load_state_dict(ckpt["decoder"])
+        print(f"initialized from {a.init} (step {ckpt['step']}, loss {ckpt['args'].get('loss', 'mse')})", file=sys.stderr)
+    elif a.loss == "superflex":
+        print("WARNING: --loss superflex from a random init usually collapses (no gradient far from the "
+              "object); use --init <mse run>/decoder.pt", file=sys.stderr)
     opt = torch.optim.AdamW(dec.parameters(), lr=a.lr, weight_decay=a.weight_decay)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda i: min(1.0, (i + 1) / a.warmup) *
                                               0.5 * (1 + math.cos(math.pi * min(i, a.steps) / a.steps)))
