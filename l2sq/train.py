@@ -38,7 +38,7 @@ import torch
 import torch.nn.functional as F
 
 from l2sq.data import GeomTargets, GTSuperquadrics, ViewPool, collate, make_sample, random_views
-from l2sq.geom_loss import occupancy_iou, superflex_loss
+from l2sq.geom_loss import chamfer_loss, occupancy_iou, superflex_loss
 from l2sq.model import FrozenVGGT, SQDecoder
 from l2sq.sq import chamfer, geodesic_deg, sample_surface, sq_mesh
 
@@ -86,19 +86,28 @@ def loss_config(args: dict) -> dict:
     """Everything compute_loss needs, from the run's arguments (also used by l2sq.predict)."""
     w = loss_weights(args)
     w.update(iou=args.get("w_iou", 0.2), sdf=args.get("w_sdf", 0.2), overlap=args.get("w_overlap", 5.0),
-             sparsity=args.get("w_sparsity", 1.26), exist_sf=args.get("w_exist_sf", 0.02))
+             sparsity=args.get("w_sparsity", 1.26), exist_sf=args.get("w_exist_sf", 0.02),
+             cd_p2sq=args.get("w_p2sq", 1.0), cd_sq2p=args.get("w_sq2p", 1.0), parsimony=args.get("w_par", 0.06),
+             exist_cd=args.get("w_exist_cd", 0.01), cd_rigid=args.get("w_rigid", 1.0))
+    exist_mode = args.get("exist_mode") or ("soft" if args.get("loss") == "chamfer" else "hard")
     return {"loss": args.get("loss", "mse"), "w": w, "scale_loss": args.get("scale_loss", "linear"),
             "w_mse": args.get("w_mse", 0.0), "truncation": args.get("truncation", 0.05),
-            "neg_slope": args.get("neg_slope", 0.1), "exist_mode": args.get("exist_mode", "soft")}
+            "neg_slope": args.get("neg_slope", 0.1), "exist_mode": exist_mode,
+            "n_sq_samples": args.get("n_sq_samples", 256), "tau_assign": args.get("tau_assign", 0.01)}
 
 
 def compute_loss(pred: dict, tgt: dict, cfg: dict) -> tuple[torch.Tensor, dict]:
     """--loss mse: parameter MSE vs the pseudo-GT (fixed slots).
+    --loss chamfer: SuperDec's Chamfer + parsimony + existence vs the GT surface points (from scratch).
     --loss superflex: SuperFlex's IoU + SDF (+ overlap, sparsity, existence) vs the GT geometry,
     plus w_mse x the parameter MSE if --w-mse > 0."""
     if cfg["loss"] == "mse":
         return mse_loss(pred, tgt, cfg["w"], cfg["scale_loss"])
-    total, parts = superflex_loss(pred, tgt, cfg["w"], cfg["truncation"], cfg["neg_slope"], cfg["exist_mode"])
+    if cfg["loss"] == "chamfer":
+        total, parts = chamfer_loss(pred, tgt, cfg["w"], cfg["exist_mode"], cfg["n_sq_samples"], cfg["tau_assign"],
+                                    rigid_term=cfg["w"]["cd_rigid"] > 0)
+    else:
+        total, parts = superflex_loss(pred, tgt, cfg["w"], cfg["truncation"], cfg["neg_slope"], cfg["exist_mode"])
     if cfg["w_mse"] > 0:
         l_mse, mse_parts = mse_loss(pred, tgt, cfg["w"], cfg["scale_loss"])
         total = total + cfg["w_mse"] * l_mse
@@ -232,17 +241,28 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--w-bend", type=float, default=1.0, help="--deform only: bending amount and direction")
     p.add_argument("--deform", action="store_true",
                    help="deformable superquadrics: GT fit with tapering/bending (gt_sq_deform.npz), 26 outputs per query")
-    p.add_argument("--loss", choices=["mse", "superflex"], default="mse",
-                   help="mse: parameters vs pseudo-GT (fixed slots); superflex: IoU + SDF vs the GT geometry")
+    p.add_argument("--loss", choices=["mse", "chamfer", "superflex"], default="mse",
+                   help="mse: parameters vs pseudo-GT (fixed slots); chamfer: SuperDec (self-supervised, from "
+                        "scratch); superflex: IoU + SDF vs the GT geometry (needs --init)")
+    p.add_argument("--w-p2sq", type=float, default=1.0, help="--loss chamfer weights (SuperDec)")
+    p.add_argument("--w-sq2p", type=float, default=1.0)
+    p.add_argument("--w-par", type=float, default=0.06, help="parsimony (SuperDec: 0.06; supp.: 0.1 then 0.6)")
+    p.add_argument("--w-exist-cd", type=float, default=0.01)
+    p.add_argument("--w-rigid", type=float, default=1.0,
+                   help="--deform: Chamfer of the rigid part (tapering/bending off), SuperFlex L_rigid; 0 = off")
+    p.add_argument("--deform-start", type=int, default=0,
+                   help="--deform: tapering/bending forced to 0 in the loss until this step (rigid first)")
+    p.add_argument("--n-sq-samples", type=int, default=256, help="--loss chamfer: surface points per superquadric")
+    p.add_argument("--tau-assign", type=float, default=0.01, help="soft point-to-primitive assignment temperature")
     p.add_argument("--w-iou", type=float, default=0.2, help="--loss superflex weights (SuperFlex train.yaml)")
     p.add_argument("--w-sdf", type=float, default=0.2)
     p.add_argument("--w-overlap", type=float, default=5.0)
     p.add_argument("--w-sparsity", type=float, default=1.26)
     p.add_argument("--w-exist-sf", type=float, default=0.02)
     p.add_argument("--w-mse", type=float, default=0.0, help="--loss superflex: + this x the parameter MSE")
-    p.add_argument("--exist-mode", choices=["hard", "soft"], default="hard",
-                   help="hard: only existing primitives in IoU/SDF (SuperFlex test-time optimization, for --init); "
-                        "soft: existence-weighted (SuperFlex training loss)")
+    p.add_argument("--exist-mode", choices=["hard", "soft"], default=None,
+                   help="hard: only existing primitives in the loss (for --init; default for superflex); "
+                        "soft: existence-weighted (SuperDec/SuperFlex training; default for chamfer)")
     p.add_argument("--truncation", type=float, default=0.05, help="SDF truncation delta (normalized units)")
     p.add_argument("--neg-slope", type=float, default=0.1, help="SDF weight omega for points inside")
     p.add_argument("--n-surf", type=int, default=4096, help="GT surface points per sample")
@@ -343,7 +363,10 @@ def main(argv: list[str] | None = None) -> None:
         n = int(rng.integers(a.n_min, a.n_max + 1))
         batch = [make_sample(train_pool, gt, random_views(rng, len(train_pool), n)) for _ in range(a.batch)]
         tgt = collate(train_pool, batch, a.queries, device, geom, rng, a.n_surf, a.n_vol)
-        loss, parts = compute_loss(dec(vggt(tgt["images"])), tgt, cfg)
+        pred = dec(vggt(tgt["images"]))
+        if a.deform and step <= a.deform_start:      # rigid phase: deformation outputs get no gradient
+            pred = {**pred, "taper": torch.zeros_like(pred["taper"]), "bend": torch.zeros_like(pred["bend"])}
+        loss, parts = compute_loss(pred, tgt, cfg)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(dec.parameters(), 1.0)

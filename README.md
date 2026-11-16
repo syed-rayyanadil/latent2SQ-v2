@@ -171,6 +171,19 @@ Per step: one N ∈ [1, 8] drawn uniformly (the whole run, no schedule), then pe
 
 Loss (all MSE over the GT slots, weights `--w-*`, default 1): `t`, `R` (3×3 matrix), `scale` on log(scale) (`--scale-loss linear` = old behaviour, used by `runs/chair_L1`), `eps`, `exist` (BCE over all P queries); with `--deform` also `taper`, `bend`, and `alpha` (direction as a unit 2D vector, weighted by the target bending amount; `--w-bend` sets both).
 
+**Chamfer loss (`--loss chamfer`)**, SuperDec's self-supervised loss (Fedele et al. 2025, Eqs. 4–9), in `l2sq/geom_loss.py`, **from scratch** (no `--init`, no pseudo-GT parameters in the loss):
+- `cd_p2sq`: each GT surface point (`--n-surf`, `gt_world.npz`) to its nearest point on the superquadrics, weighted by a soft point-to-primitive assignment `softmax(-d / --tau-assign + log existence)` (SuperDec learns this assignment from point features; our decoder sees images, so it is derived from the distances)
+- `cd_sq2p`: each sampled superquadric point to its nearest GT point, averaged per primitive and weighted by existence
+- `parsimony` (0.5-norm of primitive usage, `--w-par 0.06`), `exist_cd` (BCE, target = closest primitive for > 24 of 4096 points, `--w-exist-cd 0.01`)
+- with `--deform`: `cd_rigid` = the same Chamfer with tapering/bending off (SuperFlex's L_rigid, `--w-rigid 1`), and `--deform-start K` keeps tapering/bending at 0 in the loss for the first K steps (rigid first). The deformation outputs start rigid (SuperFlex's head init: taper 0, bend sigmoid(−6), direction angle 0).
+
+Superquadric points are spread evenly over the surface area (`sample_surface_uniform`: grid triangles picked with probability ∝ area, random point inside; the plain (η, ω) grid bunches points at poles and box edges, which would bias Chamfer). `--n-sq-samples 256` per primitive. Unlike IoU + SDF, Chamfer has a gradient at any distance (every GT point pulls the nearest surface point), which is why it trains from scratch. Expect coarser shapes than IoU + SDF ("overly rounded", SuperFlex) — that is the SuperDec → SuperFlex fine-tuning step.
+```bash
+python -m l2sq.train --train $OBJ/train --test $OBJ/test --gt-sq $OBJ/gt_sq_rigid.npz --loss chamfer --out runs/chair_L1_cd
+python -m l2sq.train --train $OBJ/train --test $OBJ/test --gt-sq $OBJ/gt_sq_deform.npz --deform --loss chamfer \
+    --deform-start 1000 --out runs/chair_L1_deform_cd
+```
+
 **Geometric loss (`--loss superflex`)**, SuperFlex's training loss (paper Sec. 4.1, App. B.2; code `superflex/loss/loss.py` IoULoss), in `l2sq/geom_loss.py`. No pseudo-GT parameters: only the GT geometry in the sample frame, so the decoder chooses its own decomposition and slot order:
 - `iou`: −log soft IoU between the existence-weighted union of the predicted superquadrics (soft occupancy σ(−d/τ), τ = 1e-3) and the mesh occupancy at `--n-vol` volume points (uniform in the padded bounding cube, labels from the voxelized mesh, computed at startup)
 - `sdf`: radial distance of `--n-surf` GT surface points (`gt_world.npz`) to the union, truncated (`--truncation` 0.05), points inside weighted by `--neg-slope` 0.1
@@ -196,7 +209,7 @@ python -m l2sq.train --train $OBJ/train --test $OBJ/test --gt-sq $OBJ/gt_sq_defo
 Every `--eval-every` steps: fixed samples for N ∈ {1, 2, 4, 8} on train and test views → rotation error, translation error, relative scale error, exponent error, Chamfer between predicted and **pseudo-GT** superquadric surfaces (×*s*, object-radius units), existence accuracy, number of predicted superquadrics; `--deform` adds `taper_err`, `bend_err`. Against the GT geometry (any loss): `iou` = occupancy IoU of the predicted union vs the mesh, `chamfer_gt` = Chamfer vs GT surface points (×*s*). `iou_target` = the same IoU for the pseudo-GT superquadrics (checks the occupancy labels and the distance function; should be close to the fit's IoU). With `--init`, an evaluation also runs at step 0, i.e. the starting point. With `--loss superflex` the slot order is free, so the per-slot parameter errors are not meaningful there: use `iou` and `chamfer_gt`.
 
 → `runs/<name>/`: `args.json`, `metrics.jsonl`, `eval_final.json`, `decoder.pt`, `examples/<split>_N<n>_<k>/{gt_sq,pred_sq}.ply` (random views), `tb/`.
-Options: `--layers 3`, `--queries 16`, `--steps 3000`, `--batch 2`, `--n-min/--n-max`, `--vggt-layer 23`, `--w-t/--w-R/--w-scale/--w-eps/--w-exist/--w-taper/--w-bend` (MSE), `--loss`, `--w-iou/--w-sdf/--w-overlap/--w-sparsity/--w-exist-sf/--w-mse` (superflex), `--n-surf/--n-vol`, `--no-tb`. One run (3000 steps) takes ~2 h on the RTX A2000; each log line shows the peak GPU memory actually used (`nvidia-smi` shows PyTorch's cache, which is larger).
+Options: `--layers 3`, `--queries 16`, `--steps 3000`, `--batch 2`, `--n-min/--n-max`, `--vggt-layer 23`, `--w-t/--w-R/--w-scale/--w-eps/--w-exist/--w-taper/--w-bend` (MSE), `--loss mse|chamfer|superflex`, `--w-p2sq/--w-sq2p/--w-par/--w-exist-cd/--w-rigid/--deform-start/--n-sq-samples` (chamfer), `--w-iou/--w-sdf/--w-overlap/--w-sparsity/--w-exist-sf/--w-mse` (superflex), `--exist-mode` (default soft for chamfer, hard for superflex), `--n-surf/--n-vol`, `--no-tb`. One run (3000 steps) takes ~2 h on the RTX A2000; each log line shows the peak GPU memory actually used (`nvidia-smi` shows PyTorch's cache, which is larger).
 
 ### 3. Predict and visualize
 `l2sq.predict` uses views 0…N−1 of a split, so the reference is camera 0 and the prediction lines up with the split viewer. It reads the run's `args.json`, so a rigid run predicts rigid and a `--deform` run deformable superquadrics (`sample.json` → `"deform"`).

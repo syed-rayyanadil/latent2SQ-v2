@@ -129,6 +129,38 @@ def sample_surface(scale, eps, R, t, n_eta: int = 16, n_omega: int = 32,
     return local @ R.transpose(-1, -2) + t.unsqueeze(-2)
 
 
+def grid_faces(n_eta: int, n_omega: int, device=None) -> torch.Tensor:
+    """Triangles (F,3) of the (eta, omega) parameter grid, vertex index = i_eta * n_omega + i_omega."""
+    i, j = torch.meshgrid(torch.arange(n_eta - 1, device=device), torch.arange(n_omega - 1, device=device), indexing="ij")
+    a, b = i * n_omega + j, i * n_omega + j + 1
+    c, d = (i + 1) * n_omega + j, (i + 1) * n_omega + j + 1
+    return torch.cat([torch.stack([a, b, c], -1).reshape(-1, 3), torch.stack([c, b, d], -1).reshape(-1, 3)])
+
+
+def sample_surface_uniform(scale, eps, R, t, n: int, taper=None, bend=None, alpha=None,
+                           n_eta: int = 24, n_omega: int = 48) -> torch.Tensor:
+    """n points per superquadric, evenly spread over its (deformed) surface area, differentiable.
+
+    The parameter grid alone is not even (points bunch up at the poles and box edges), so: build
+    the grid's triangles, pick n of them with probability proportional to their area, and a
+    uniformly random point inside each (barycentric). The choice is random and not differentiated;
+    the points are differentiable functions of the parameters. (..., n, 3)."""
+    grid = sample_surface(scale, eps, R, t, n_eta, n_omega, taper, bend, alpha)        # (..., K, 3)
+    lead, K = grid.shape[:-2], grid.shape[-2]
+    g = grid.reshape(-1, K, 3)                                                          # (Q, K, 3)
+    faces = grid_faces(n_eta, n_omega, g.device)                                        # (F, 3)
+    tri = g[:, faces]                                                                   # (Q, F, 3, 3)
+    with torch.no_grad():
+        area = torch.linalg.cross(tri[:, :, 1] - tri[:, :, 0], tri[:, :, 2] - tri[:, :, 0]).norm(dim=-1)
+        idx = torch.multinomial(area + 1e-12, n, replacement=True)                      # (Q, n)
+        u, v = torch.rand(2, *idx.shape, 1, device=g.device)
+        flip = (u + v) > 1                                                              # fold into the triangle
+        u, v = torch.where(flip, 1 - u, u), torch.where(flip, 1 - v, v)
+    t3 = torch.gather(tri, 1, idx[..., None, None].expand(-1, -1, 3, 3))                # (Q, n, 3, 3)
+    pts = t3[:, :, 0] + u * (t3[:, :, 1] - t3[:, :, 0]) + v * (t3[:, :, 2] - t3[:, :, 0])
+    return pts.reshape(*lead, n, 3)
+
+
 def sq_mesh(scale, eps, R, t, colors=None, n_eta: int = 24, n_omega: int = 48, taper=None, bend=None, alpha=None):
     """trimesh mesh of a set of superquadrics (numpy or torch inputs, leading dim = primitives)."""
     import trimesh

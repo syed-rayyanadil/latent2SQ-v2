@@ -74,6 +74,12 @@ class SQDecoder(nn.Module):
             for _ in range(n_layers)
         ])
         self.head = nn.Linear(d_model, 26 if deform else 15)
+        if deform:  # SuperFlex heads.py: start rigid -> taper 0, bend sigmoid(-6) ~ 0.0025, direction (sin, cos) = (0, 1)
+            with torch.no_grad():
+                self.head.weight[15:].zero_()
+                self.head.bias[15:17] = 0.0
+                self.head.bias[17:20] = -6.0
+                self.head.bias[20:26] = torch.tensor([0.0, 1.0] * 3)
 
     def forward(self, tokens: torch.Tensor) -> dict:
         B, N, T, _ = tokens.shape
