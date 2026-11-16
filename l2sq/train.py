@@ -89,7 +89,7 @@ def loss_config(args: dict) -> dict:
              sparsity=args.get("w_sparsity", 1.26), exist_sf=args.get("w_exist_sf", 0.02))
     return {"loss": args.get("loss", "mse"), "w": w, "scale_loss": args.get("scale_loss", "linear"),
             "w_mse": args.get("w_mse", 0.0), "truncation": args.get("truncation", 0.05),
-            "neg_slope": args.get("neg_slope", 0.1)}
+            "neg_slope": args.get("neg_slope", 0.1), "exist_mode": args.get("exist_mode", "soft")}
 
 
 def compute_loss(pred: dict, tgt: dict, cfg: dict) -> tuple[torch.Tensor, dict]:
@@ -98,7 +98,7 @@ def compute_loss(pred: dict, tgt: dict, cfg: dict) -> tuple[torch.Tensor, dict]:
     plus w_mse x the parameter MSE if --w-mse > 0."""
     if cfg["loss"] == "mse":
         return mse_loss(pred, tgt, cfg["w"], cfg["scale_loss"])
-    total, parts = superflex_loss(pred, tgt, cfg["w"], cfg["truncation"], cfg["neg_slope"])
+    total, parts = superflex_loss(pred, tgt, cfg["w"], cfg["truncation"], cfg["neg_slope"], cfg["exist_mode"])
     if cfg["w_mse"] > 0:
         l_mse, mse_parts = mse_loss(pred, tgt, cfg["w"], cfg["scale_loss"])
         total = total + cfg["w_mse"] * l_mse
@@ -130,7 +130,7 @@ def evaluate(vggt, dec, pool, samples_by_n, P, batch, device, cfg: dict, geom: G
     rng = np.random.default_rng(1234)   # same GT point subsets at every evaluation
     for n, samples in samples_by_n.items():
         acc = {k: [] for k in ["loss", "rot_deg", "t_err_world", "scale_rel_err", "eps_err",
-                               "exist_acc", "n_pred", "chamfer_world", "iou", "chamfer_gt"]}
+                               "exist_acc", "n_pred", "chamfer_world", "iou", "chamfer_gt", "iou_target"]}
         if dec.deform:
             acc.update(taper_err=[], bend_err=[])
         for i in range(0, len(samples), batch):
@@ -159,6 +159,7 @@ def evaluate(vggt, dec, pool, samples_by_n, P, batch, device, cfg: dict, geom: G
                 acc["chamfer_gt"].append(float(chamfer(p_pts, tgt["surf"][b]) * tgt["s"][b]))
             keep_all = torch.where(exist_pred.any(-1, keepdim=True), exist_pred, m)
             acc["iou"] += occupancy_iou(pred, tgt, keep_all).tolist()
+            acc["iou_target"] += occupancy_iou(tgt, tgt, m).tolist()   # pseudo-GT itself: checks labels + distances
         out[f"N{n}"] = {k: float(np.mean(v)) for k, v in acc.items()}
     out["all"] = {k: float(np.mean([out[f"N{n}"][k] for n in samples_by_n])) for k in next(iter(out.values()))}
     dec.train()
@@ -239,6 +240,9 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--w-sparsity", type=float, default=1.26)
     p.add_argument("--w-exist-sf", type=float, default=0.02)
     p.add_argument("--w-mse", type=float, default=0.0, help="--loss superflex: + this x the parameter MSE")
+    p.add_argument("--exist-mode", choices=["hard", "soft"], default="hard",
+                   help="hard: only existing primitives in IoU/SDF (SuperFlex test-time optimization, for --init); "
+                        "soft: existence-weighted (SuperFlex training loss)")
     p.add_argument("--truncation", type=float, default=0.05, help="SDF truncation delta (normalized units)")
     p.add_argument("--neg-slope", type=float, default=0.1, help="SDF weight omega for points inside")
     p.add_argument("--n-surf", type=int, default=4096, help="GT surface points per sample")
@@ -307,6 +311,33 @@ def main(argv: list[str] | None = None) -> None:
     tb_eval = {split: make_writer(out / "tb" / f"eval_{split}") for split in ("train", "test")} if tb else {}
     if tb is not None:
         tb.add_text("args", "```\n" + json.dumps(vars(a), indent=2) + "\n```")
+    res = {}
+
+    def run_eval(step: int) -> None:
+        res.clear()
+        res["step"] = step
+        for split, (pool, samples) in eval_sets.items():
+            res[split] = evaluate(vggt, dec, pool, samples, a.queries, a.batch, device, cfg, geom)
+        metrics_f.write(json.dumps(res) + "\n")
+        metrics_f.flush()
+        for split, writer in tb_eval.items():
+            for key in ["all"] + [f"N{n}" for n in EVAL_NS]:
+                for metric, value in res[split][key].items():
+                    writer.add_scalar(f"eval_{key}/{metric}", value, step)
+            writer.flush()
+        for split in eval_sets:
+            r = res[split]["all"]
+            print(f"[eval {split:5s} step {step}] loss {r['loss']:.4f}  rot {r['rot_deg']:.1f}deg  "
+                  f"t {r['t_err_world']:.4f}  scale {100 * r['scale_rel_err']:.1f}%  "
+                  f"chamfer {r['chamfer_world']:.4f}  IoU {r['iou']:.3f}  chamfer-gt {r['chamfer_gt']:.4f}  "
+                  f"exist-acc {r['exist_acc']:.3f}  IoU-target {r['iou_target']:.3f}  "
+                  f"#SQ {r['n_pred']:.1f}/{len(gt)}", file=sys.stderr)
+        if step > 0:
+            torch.save({"decoder": dec.state_dict(), "args": vars(a), "step": step}, out / "decoder.pt")
+
+    if a.init:   # starting point of the fine-tuning
+        run_eval(0)
+
     running, t0 = {}, time.time()
     for step in range(1, a.steps + 1):
         n = int(rng.integers(a.n_min, a.n_max + 1))
@@ -339,24 +370,7 @@ def main(argv: list[str] | None = None) -> None:
             running, t0 = {}, time.time()
 
         if step % a.eval_every == 0 or step == a.steps:
-            res = {"step": step}
-            for split, (pool, samples) in eval_sets.items():
-                res[split] = evaluate(vggt, dec, pool, samples, a.queries, a.batch, device, cfg, geom)
-            metrics_f.write(json.dumps(res) + "\n")
-            metrics_f.flush()
-            for split, writer in tb_eval.items():
-                for key in ["all"] + [f"N{n}" for n in EVAL_NS]:
-                    for metric, value in res[split][key].items():
-                        writer.add_scalar(f"eval_{key}/{metric}", value, step)
-                writer.flush()
-            for split in eval_sets:
-                r = res[split]["all"]
-                print(f"[eval {split:5s} step {step}] loss {r['loss']:.4f}  rot {r['rot_deg']:.1f}deg  "
-                      f"t {r['t_err_world']:.4f}  scale {100 * r['scale_rel_err']:.1f}%  "
-                      f"chamfer {r['chamfer_world']:.4f}  IoU {r['iou']:.3f}  chamfer-gt {r['chamfer_gt']:.4f}  "
-                      f"exist-acc {r['exist_acc']:.3f}  "
-                      f"#SQ {r['n_pred']:.1f}/{len(gt)}", file=sys.stderr)
-            torch.save({"decoder": dec.state_dict(), "args": vars(a), "step": step}, out / "decoder.pt")
+            run_eval(step)
             t0 = time.time()
 
     for split, (pool, samples) in eval_sets.items():

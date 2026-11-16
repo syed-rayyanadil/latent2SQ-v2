@@ -99,10 +99,23 @@ def normalize(pred: dict, tgt: dict) -> tuple[dict, torch.Tensor, torch.Tensor, 
 
 
 def superflex_loss(pred: dict, tgt: dict, w: dict, truncation: float = 0.05,
-                   neg_slope: float = 0.1) -> tuple[torch.Tensor, dict]:
+                   neg_slope: float = 0.1, exist_mode: str = "hard") -> tuple[torch.Tensor, dict]:
+    """exist_mode 'hard' (default, SuperFlex's test-time optimization): only the currently existing
+    primitives (p > 0.5, no gradient) take part in IoU / SDF / sparsity; existence is trained only by
+    L_exist, whose targets are computed among them -> primitives can switch off, never on.
+    'soft' (SuperFlex's training loss): existence-weighted union. From a warm start this switches on
+    the queries an MSE decoder kept off, whose geometry was never trained, and diverges."""
     sq, surf, vol, _ = normalize(pred, tgt)
-    exist = torch.sigmoid(pred["exist_logit"])                                     # (B,P)
-    log_e = torch.log(exist.clamp_min(1e-6))[..., None]                            # (B,P,1)
+    if exist_mode == "hard":
+        active = torch.sigmoid(pred["exist_logit"]).detach() > 0.5                 # (B,P)
+        none = ~active.any(1, keepdim=True)
+        active = active | none                                                     # all on if none exists
+        exist = active.float()
+        log_e = torch.where(active, 0.0, -1e4)[..., None]
+    else:
+        active = None
+        exist = torch.sigmoid(pred["exist_logit"])                                 # (B,P)
+        log_e = torch.log(exist.clamp_min(1e-6))[..., None]                        # (B,P,1)
 
     # surface: soft minimum of the existence-weighted distances = distance to the union
     d_s = radial_distance(surf, sq)                                                # (B,P,Ms)
@@ -129,7 +142,8 @@ def superflex_loss(pred: dict, tgt: dict, w: dict, truncation: float = 0.05,
     assign = torch.softmax(logits, dim=1)                                          # (B,P,Ms)
     usage = assign.mean(-1)                                                        # (B,P)
     l_sparsity = (usage + 0.01).sqrt().mean(1).pow(2).mean()
-    counts = F.one_hot(d_s.abs().argmin(1), d_s.shape[1]).sum(1).float()           # (B,P) closest-primitive counts
+    d_closest = d_s.abs() if active is None else d_s.abs().masked_fill(~active[..., None], float("inf"))
+    counts = F.one_hot(d_closest.argmin(1), d_s.shape[1]).sum(1).float()           # (B,P) closest-primitive counts
     exist_tgt = (counts > EXIST_POINTS * d_s.shape[-1] / 4096).float()
     l_exist = F.binary_cross_entropy_with_logits(pred["exist_logit"], exist_tgt)
 
