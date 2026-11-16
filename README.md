@@ -171,10 +171,22 @@ Per step: one N ∈ [1, 8] drawn uniformly (the whole run, no schedule), then pe
 
 Loss (all MSE over the GT slots, weights `--w-*`, default 1): `t`, `R` (3×3 matrix), `scale` on log(scale) (`--scale-loss linear` = old behaviour, used by `runs/chair_L1`), `eps`, `exist` (BCE over all P queries); with `--deform` also `taper`, `bend`, and `alpha` (direction as a unit 2D vector, weighted by the target bending amount; `--w-bend` sets both).
 
-Every `--eval-every` steps: fixed samples for N ∈ {1, 2, 4, 8} on train and test views → rotation error, translation error, relative scale error, exponent error, Chamfer between predicted and **pseudo-GT** superquadric surfaces (×*s*, object-radius units), existence accuracy, number of predicted superquadrics; `--deform` adds `taper_err`, `bend_err`.
+**Geometric loss (`--loss superflex`)**, SuperFlex's training loss (paper Sec. 4.1, App. B.2; code `superflex/loss/loss.py` IoULoss), in `l2sq/geom_loss.py`. No pseudo-GT parameters: only the GT geometry in the sample frame, so the decoder chooses its own decomposition and slot order:
+- `iou`: −log soft IoU between the existence-weighted union of the predicted superquadrics (soft occupancy σ(−d/τ), τ = 1e-3) and the mesh occupancy at `--n-vol` volume points (uniform in the padded bounding cube, labels from the voxelized mesh, computed at startup)
+- `sdf`: radial distance of `--n-surf` GT surface points (`gt_world.npz`) to the union, truncated (`--truncation` 0.05), points inside weighted by `--neg-slope` 0.1
+- `overlap` (volume inside more than one primitive), `sparsity` (0.5-norm of primitive usage), `exist_sf` (BCE, target = primitive is closest for > 24 of 4096 surface points)
+
+Weights default to SuperFlex's `configs/train.yaml`: `--w-iou 0.2 --w-sdf 0.2 --w-overlap 5 --w-sparsity 1.26 --w-exist-sf 0.02`. Distances are computed after normalizing each sample as SuperFlex normalizes its input (centered, object in a unit cube), so these hyperparameters keep their meaning. One deviation: SuperFlex weights `sdf` with a learned point-to-primitive assignment from its point encoder; our decoder sees images, not points, so `sdf` uses the distance to the union (soft minimum over primitives, as SuperFlex's test-time optimization does), and sparsity/existence use the same soft assignment. `--w-mse 1` adds the parameter MSE (needs fixed slots) as extra supervision.
+```bash
+python -m l2sq.train --train $OBJ/train --test $OBJ/test --gt-sq $OBJ/gt_sq_rigid.npz --loss superflex --out runs/chair_L1_sf
+python -m l2sq.train --train $OBJ/train --test $OBJ/test --gt-sq $OBJ/gt_sq_deform.npz --deform --loss superflex --out runs/chair_L1_deform_sf
+```
+(`--gt-sq` is still read: for the parameter metrics and `--w-mse`.)
+
+Every `--eval-every` steps: fixed samples for N ∈ {1, 2, 4, 8} on train and test views → rotation error, translation error, relative scale error, exponent error, Chamfer between predicted and **pseudo-GT** superquadric surfaces (×*s*, object-radius units), existence accuracy, number of predicted superquadrics; `--deform` adds `taper_err`, `bend_err`. Against the GT geometry (any loss): `iou` = occupancy IoU of the predicted union vs the mesh, `chamfer_gt` = Chamfer vs GT surface points (×*s*). With `--loss superflex` the slot order is free, so the per-slot parameter errors are not meaningful there: use `iou` and `chamfer_gt`.
 
 → `runs/<name>/`: `args.json`, `metrics.jsonl`, `eval_final.json`, `decoder.pt`, `examples/<split>_N<n>_<k>/{gt_sq,pred_sq}.ply` (random views), `tb/`.
-Options: `--layers 3`, `--queries 16`, `--steps 3000`, `--batch 2`, `--n-min/--n-max`, `--vggt-layer 23`, `--w-t/--w-R/--w-scale/--w-eps/--w-exist/--w-taper/--w-bend`, `--no-tb`. One run (3000 steps) takes ~2 h on the RTX A2000; each log line shows the peak GPU memory actually used (`nvidia-smi` shows PyTorch's cache, which is larger).
+Options: `--layers 3`, `--queries 16`, `--steps 3000`, `--batch 2`, `--n-min/--n-max`, `--vggt-layer 23`, `--w-t/--w-R/--w-scale/--w-eps/--w-exist/--w-taper/--w-bend` (MSE), `--loss`, `--w-iou/--w-sdf/--w-overlap/--w-sparsity/--w-exist-sf/--w-mse` (superflex), `--n-surf/--n-vol`, `--no-tb`. One run (3000 steps) takes ~2 h on the RTX A2000; each log line shows the peak GPU memory actually used (`nvidia-smi` shows PyTorch's cache, which is larger).
 
 ### 3. Predict and visualize
 `l2sq.predict` uses views 0…N−1 of a split, so the reference is camera 0 and the prediction lines up with the split viewer. It reads the run's `args.json`, so a rigid run predicts rigid and a `--deform` run deformable superquadrics (`sample.json` → `"deform"`).

@@ -37,7 +37,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from l2sq.data import GTSuperquadrics, ViewPool, collate, make_sample, random_views
+from l2sq.data import GeomTargets, GTSuperquadrics, ViewPool, collate, make_sample, random_views
+from l2sq.geom_loss import occupancy_iou, superflex_loss
 from l2sq.model import FrozenVGGT, SQDecoder
 from l2sq.sq import chamfer, geodesic_deg, sample_surface, sq_mesh
 
@@ -81,6 +82,30 @@ def loss_weights(args: dict) -> dict:
     return w
 
 
+def loss_config(args: dict) -> dict:
+    """Everything compute_loss needs, from the run's arguments (also used by l2sq.predict)."""
+    w = loss_weights(args)
+    w.update(iou=args.get("w_iou", 0.2), sdf=args.get("w_sdf", 0.2), overlap=args.get("w_overlap", 5.0),
+             sparsity=args.get("w_sparsity", 1.26), exist_sf=args.get("w_exist_sf", 0.02))
+    return {"loss": args.get("loss", "mse"), "w": w, "scale_loss": args.get("scale_loss", "linear"),
+            "w_mse": args.get("w_mse", 0.0), "truncation": args.get("truncation", 0.05),
+            "neg_slope": args.get("neg_slope", 0.1)}
+
+
+def compute_loss(pred: dict, tgt: dict, cfg: dict) -> tuple[torch.Tensor, dict]:
+    """--loss mse: parameter MSE vs the pseudo-GT (fixed slots).
+    --loss superflex: SuperFlex's IoU + SDF (+ overlap, sparsity, existence) vs the GT geometry,
+    plus w_mse x the parameter MSE if --w-mse > 0."""
+    if cfg["loss"] == "mse":
+        return mse_loss(pred, tgt, cfg["w"], cfg["scale_loss"])
+    total, parts = superflex_loss(pred, tgt, cfg["w"], cfg["truncation"], cfg["neg_slope"])
+    if cfg["w_mse"] > 0:
+        l_mse, mse_parts = mse_loss(pred, tgt, cfg["w"], cfg["scale_loss"])
+        total = total + cfg["w_mse"] * l_mse
+        parts.update({f"mse_{k}": v for k, v in mse_parts.items()}, mse=l_mse.item())
+    return total, parts
+
+
 # --------------------------------------------------------------------------- evaluation
 
 def eval_samples(pool, gt, ns, per_n, seed):
@@ -96,19 +121,23 @@ def sq_args(d: dict, b: int, sel, s: float = 1.0) -> tuple:
 
 
 @torch.no_grad()
-def evaluate(vggt, dec, pool, samples_by_n, P, batch, device, w, scale_loss="log") -> dict:
+def evaluate(vggt, dec, pool, samples_by_n, P, batch, device, cfg: dict, geom: GeomTargets) -> dict:
+    """Parameter errors are per GT slot (query m vs GT superquadric m): meaningful for --loss mse
+    (and --w-mse > 0); with the pure geometric loss the decoder picks its own slot order, so use
+    iou (occupancy of the predicted union vs the mesh) and chamfer_gt (vs GT surface points) there."""
     dec.eval()
     out = {}
+    rng = np.random.default_rng(1234)   # same GT point subsets at every evaluation
     for n, samples in samples_by_n.items():
         acc = {k: [] for k in ["loss", "rot_deg", "t_err_world", "scale_rel_err", "eps_err",
-                               "exist_acc", "n_pred", "chamfer_world"]}
+                               "exist_acc", "n_pred", "chamfer_world", "iou", "chamfer_gt"]}
         if dec.deform:
             acc.update(taper_err=[], bend_err=[])
         for i in range(0, len(samples), batch):
             chunk = samples[i:i + batch]
-            tgt = collate(pool, chunk, P, device)
+            tgt = collate(pool, chunk, P, device, geom, rng, cfg.get("n_surf", 4096), cfg.get("n_vol", 32768))
             pred = dec(vggt(tgt["images"]))
-            loss, _ = mse_loss(pred, tgt, w, scale_loss)
+            loss, _ = compute_loss(pred, tgt, cfg)
             acc["loss"].append(float(loss))
             m = tgt["exist"] > 0.5
             s = tgt["s"][:, None]
@@ -127,6 +156,9 @@ def evaluate(vggt, dec, pool, samples_by_n, P, batch, device, w, scale_loss="log
                 p_pts = sample_surface(*sq_args(pred, b, keep)).reshape(-1, 3)
                 g_pts = sample_surface(*sq_args(tgt, b, m[b])).reshape(-1, 3)
                 acc["chamfer_world"].append(float(chamfer(p_pts, g_pts) * tgt["s"][b]))
+                acc["chamfer_gt"].append(float(chamfer(p_pts, tgt["surf"][b]) * tgt["s"][b]))
+            keep_all = torch.where(exist_pred.any(-1, keepdim=True), exist_pred, m)
+            acc["iou"] += occupancy_iou(pred, tgt, keep_all).tolist()
         out[f"N{n}"] = {k: float(np.mean(v)) for k, v in acc.items()}
     out["all"] = {k: float(np.mean([out[f"N{n}"][k] for n in samples_by_n])) for k in next(iter(out.values()))}
     dec.train()
@@ -199,6 +231,19 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--w-bend", type=float, default=1.0, help="--deform only: bending amount and direction")
     p.add_argument("--deform", action="store_true",
                    help="deformable superquadrics: GT fit with tapering/bending (gt_sq_deform.npz), 26 outputs per query")
+    p.add_argument("--loss", choices=["mse", "superflex"], default="mse",
+                   help="mse: parameters vs pseudo-GT (fixed slots); superflex: IoU + SDF vs the GT geometry")
+    p.add_argument("--w-iou", type=float, default=0.2, help="--loss superflex weights (SuperFlex train.yaml)")
+    p.add_argument("--w-sdf", type=float, default=0.2)
+    p.add_argument("--w-overlap", type=float, default=5.0)
+    p.add_argument("--w-sparsity", type=float, default=1.26)
+    p.add_argument("--w-exist-sf", type=float, default=0.02)
+    p.add_argument("--w-mse", type=float, default=0.0, help="--loss superflex: + this x the parameter MSE")
+    p.add_argument("--truncation", type=float, default=0.05, help="SDF truncation delta (normalized units)")
+    p.add_argument("--neg-slope", type=float, default=0.1, help="SDF weight omega for points inside")
+    p.add_argument("--n-surf", type=int, default=4096, help="GT surface points per sample")
+    p.add_argument("--n-vol", type=int, default=32768, help="GT volume (occupancy) points per sample")
+    p.add_argument("--gt-world", help="GT surface points, world frame (default: <train>/../gt_world.npz)")
     p.add_argument("--scale-loss", choices=["log", "linear"], default="log",
                    help="MSE on log(scale) (relative errors, default) or on scale (runs/chair_L1 used linear)")
     # logging / eval
@@ -218,12 +263,17 @@ def main(argv: list[str] | None = None) -> None:
     torch.backends.cuda.matmul.allow_tf32 = True
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
+    if a.gt_world is None:
+        a.gt_world = str(Path(a.train).parent / "gt_world.npz")
     (out / "args.json").write_text(json.dumps(vars(a), indent=2))
-    w = loss_weights(vars(a))
+    cfg = {**loss_config(vars(a)), "n_surf": a.n_surf, "n_vol": a.n_vol}
 
     print("loading views and pseudo-GT ...", file=sys.stderr)
     train_pool, test_pool = ViewPool(a.train), ViewPool(a.test)
     gt = GTSuperquadrics(a.gt_sq, deform=a.deform)
+    geom = GeomTargets(a.gt_world, Path(a.train) / "cameras.json", seed=a.seed)
+    print(f"GT geometry: {len(geom.surf)} surface points, {len(geom.vol)} volume points "
+          f"({100 * geom.occ.mean():.1f}% inside); loss: {a.loss}", file=sys.stderr)
     print(f"train views {len(train_pool)}, test views {len(test_pool)}, GT superquadrics {len(gt)}, P={a.queries}",
           file=sys.stderr)
     eval_sets = {
@@ -249,8 +299,8 @@ def main(argv: list[str] | None = None) -> None:
     for step in range(1, a.steps + 1):
         n = int(rng.integers(a.n_min, a.n_max + 1))
         batch = [make_sample(train_pool, gt, random_views(rng, len(train_pool), n)) for _ in range(a.batch)]
-        tgt = collate(train_pool, batch, a.queries, device)
-        loss, parts = mse_loss(dec(vggt(tgt["images"])), tgt, w, a.scale_loss)
+        tgt = collate(train_pool, batch, a.queries, device, geom, rng, a.n_surf, a.n_vol)
+        loss, parts = compute_loss(dec(vggt(tgt["images"])), tgt, cfg)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(dec.parameters(), 1.0)
@@ -279,7 +329,7 @@ def main(argv: list[str] | None = None) -> None:
         if step % a.eval_every == 0 or step == a.steps:
             res = {"step": step}
             for split, (pool, samples) in eval_sets.items():
-                res[split] = evaluate(vggt, dec, pool, samples, a.queries, a.batch, device, w, a.scale_loss)
+                res[split] = evaluate(vggt, dec, pool, samples, a.queries, a.batch, device, cfg, geom)
             metrics_f.write(json.dumps(res) + "\n")
             metrics_f.flush()
             for split, writer in tb_eval.items():
@@ -291,7 +341,8 @@ def main(argv: list[str] | None = None) -> None:
                 r = res[split]["all"]
                 print(f"[eval {split:5s} step {step}] loss {r['loss']:.4f}  rot {r['rot_deg']:.1f}deg  "
                       f"t {r['t_err_world']:.4f}  scale {100 * r['scale_rel_err']:.1f}%  "
-                      f"chamfer {r['chamfer_world']:.4f}  exist-acc {r['exist_acc']:.3f}  "
+                      f"chamfer {r['chamfer_world']:.4f}  IoU {r['iou']:.3f}  chamfer-gt {r['chamfer_gt']:.4f}  "
+                      f"exist-acc {r['exist_acc']:.3f}  "
                       f"#SQ {r['n_pred']:.1f}/{len(gt)}", file=sys.stderr)
             torch.save({"decoder": dec.state_dict(), "args": vars(a), "step": step}, out / "decoder.pt")
             t0 = time.time()
@@ -306,7 +357,8 @@ def main(argv: list[str] | None = None) -> None:
         for n in EVAL_NS:
             r = final[split][f"N{n}"]
             print(f"  {split:5s} N={n}: rot {r['rot_deg']:.1f}deg  t {r['t_err_world']:.4f}  "
-                  f"scale {100 * r['scale_rel_err']:.1f}%  chamfer {r['chamfer_world']:.4f}  #SQ {r['n_pred']:.1f}",
+                  f"scale {100 * r['scale_rel_err']:.1f}%  chamfer {r['chamfer_world']:.4f}  IoU {r['iou']:.3f}  "
+                  f"chamfer-gt {r['chamfer_gt']:.4f}  #SQ {r['n_pred']:.1f}",
                   file=sys.stderr)
     for writer in [tb, *tb_eval.values()]:
         if writer is not None:

@@ -86,6 +86,29 @@ class GTSuperquadrics:
         return len(self.R)
 
 
+class GeomTargets:
+    """GT geometry in the render WORLD frame for the geometric (SuperFlex) loss and GT-point metrics:
+    surface points (<obj>/gt_world.npz) and volume points with inside/outside labels (uniform in
+    the object's padded bounding cube, labels from the voxelized mesh, as SuperFlex's demo does).
+    Computed once at startup (a few seconds), nothing is written to disk."""
+
+    def __init__(self, gt_world: str | Path, cameras: str | Path, n_vol: int = 100_000, seed: int = 0):
+        from recon.gt_superquadrics import occupancy_samples, world_mesh
+
+        d = np.load(gt_world)
+        if str(d["frame"]) != "world":
+            raise ValueError(f"{gt_world} is in frame {d['frame']!s}, expected world")
+        self.surf = d["points"].astype(np.float32)
+        cams = json.loads(Path(cameras).read_text())
+        self.vol, occ = occupancy_samples(world_mesh(cams), n=n_vol, seed=seed)
+        self.occ = occ.astype(np.float32)
+
+    def draw(self, rng: np.random.Generator, n_surf: int, n_vol: int):
+        i = rng.choice(len(self.surf), n_surf, replace=False)
+        j = rng.choice(len(self.vol), n_vol, replace=False)
+        return self.surf[i], self.vol[j], self.occ[j]
+
+
 def make_sample(pool: ViewPool, gt: GTSuperquadrics, views: list[int]) -> Sample:
     s = pool.normalization(views)
     R, t, scale = to_view_frame(gt.R, gt.t, gt.scale, pool.w2c[views[0]], s)
@@ -99,8 +122,10 @@ def random_views(rng: np.random.Generator, n_pool: int, n: int) -> list[int]:
     return [int(v) for v in rng.permutation(n_pool)[:n]]
 
 
-def collate(pool: ViewPool, samples: list[Sample], P: int, device) -> dict:
-    """Stack a batch (all samples have the same N). GT slot m <-> query m (fixed assignment)."""
+def collate(pool: ViewPool, samples: list[Sample], P: int, device, geom: GeomTargets | None = None,
+            rng: np.random.Generator | None = None, n_surf: int = 4096, n_vol: int = 32768) -> dict:
+    """Stack a batch (all samples have the same N). GT slot m <-> query m (fixed assignment).
+    With geom: also surf (B,n_surf,3), vol (B,n_vol,3), occ (B,n_vol) in each sample's frame."""
     B, M = len(samples), len(samples[0].R)
     if M > P:
         raise ValueError(f"{M} GT superquadrics but only P={P} queries")
@@ -123,4 +148,15 @@ def collate(pool: ViewPool, samples: list[Sample], P: int, device) -> dict:
         if deform:
             for k in ("taper", "bend", "alpha"):
                 out[k][b, :M] = torch.as_tensor(getattr(s, k), dtype=torch.float32)
+    if geom is not None:
+        surf, vol, occ = [], [], []
+        for smp in samples:
+            w2c = pool.w2c[smp.views[0]]
+            sp, vp, oc = geom.draw(rng, n_surf, n_vol)
+            surf.append((sp @ w2c[:, :3].T + w2c[:, 3]) / smp.scale_s)
+            vol.append((vp @ w2c[:, :3].T + w2c[:, 3]) / smp.scale_s)
+            occ.append(oc)
+        out.update(surf=torch.as_tensor(np.stack(surf), dtype=torch.float32),
+                   vol=torch.as_tensor(np.stack(vol), dtype=torch.float32),
+                   occ=torch.as_tensor(np.stack(occ), dtype=torch.float32))
     return {k: (v.to(device) if k != "images" else v) for k, v in out.items()}
