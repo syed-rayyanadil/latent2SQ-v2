@@ -89,7 +89,8 @@ def loss_config(args: dict) -> dict:
              sparsity=args.get("w_sparsity", 1.26), exist_sf=args.get("w_exist_sf", 0.02),
              cd_p2sq=args.get("w_p2sq", 1.0), cd_sq2p=args.get("w_sq2p", 1.0), parsimony=args.get("w_par", 0.06),
              exist_cd=args.get("w_exist_cd", 0.01), cd_rigid=args.get("w_rigid", 1.0))
-    exist_mode = args.get("exist_mode") or ("soft" if args.get("loss") == "chamfer" else "hard")
+    # runs before 2026-11-17 stored None and were trained with "soft" for chamfer
+    exist_mode = args.get("exist_mode") or ("detach" if args.get("loss") == "chamfer" else "hard")
     return {"loss": args.get("loss", "mse"), "w": w, "scale_loss": args.get("scale_loss", "linear"),
             "w_mse": args.get("w_mse", 0.0), "truncation": args.get("truncation", 0.05),
             "neg_slope": args.get("neg_slope", 0.1), "exist_mode": exist_mode,
@@ -260,9 +261,11 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--w-sparsity", type=float, default=1.26)
     p.add_argument("--w-exist-sf", type=float, default=0.02)
     p.add_argument("--w-mse", type=float, default=0.0, help="--loss superflex: + this x the parameter MSE")
-    p.add_argument("--exist-mode", choices=["hard", "soft"], default=None,
+    p.add_argument("--exist-mode", choices=["hard", "soft", "detach"], default=None,
                    help="hard: only existing primitives in the loss (for --init; default for superflex); "
-                        "soft: existence-weighted (SuperDec/SuperFlex training; default for chamfer)")
+                        "detach: existence-weighted with a constant weight, existence learned only from "
+                        "the 'used' target (default for chamfer); soft: existence also gets the "
+                        "Chamfer gradient (chamfer: inverts existence, see geom_loss.chamfer_loss)")
     p.add_argument("--truncation", type=float, default=0.05, help="SDF truncation delta (normalized units)")
     p.add_argument("--neg-slope", type=float, default=0.1, help="SDF weight omega for points inside")
     p.add_argument("--n-surf", type=int, default=4096, help="GT surface points per sample")
@@ -291,6 +294,7 @@ def main(argv: list[str] | None = None) -> None:
     out.mkdir(parents=True, exist_ok=True)
     if a.gt_world is None:
         a.gt_world = str(Path(a.train).parent / "gt_world.npz")
+    a.exist_mode = loss_config(vars(a))["exist_mode"]     # store the resolved default with the run
     (out / "args.json").write_text(json.dumps(vars(a), indent=2))
     cfg = {**loss_config(vars(a)), "n_surf": a.n_surf, "n_vol": a.n_vol}
 

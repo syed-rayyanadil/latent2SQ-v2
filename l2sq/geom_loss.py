@@ -115,6 +115,8 @@ def superflex_loss(pred: dict, tgt: dict, w: dict, truncation: float = 0.05,
     else:
         active = None
         exist = torch.sigmoid(pred["exist_logit"])                                 # (B,P)
+        if exist_mode == "detach":                                                 # existence only from L_exist
+            exist = exist.detach()
         log_e = torch.log(exist.clamp_min(1e-6))[..., None]                        # (B,P,1)
 
     # surface: soft minimum of the existence-weighted distances = distance to the union
@@ -173,12 +175,17 @@ def _chamfer_terms(sq: dict, surf: torch.Tensor, log_e: torch.Tensor, weight: to
     return p2sq, sq2p, assign, d_pt
 
 
-def chamfer_loss(pred: dict, tgt: dict, w: dict, exist_mode: str = "soft", n_samples: int = 256,
+def chamfer_loss(pred: dict, tgt: dict, w: dict, exist_mode: str = "detach", n_samples: int = 256,
                  tau: float = 0.01, rigid_term: bool = False) -> tuple[torch.Tensor, dict]:
     """SuperDec's self-supervised loss (Fedele et al. 2025, Eqs. 4-9), on our GT surface points:
         cd_p2sq + cd_sq2p + w_par L_par + w_exist L_exist   (+ w_rigid cd_rigid with --deform)
-    exist_mode 'soft' (SuperDec): existence weights both Chamfer directions, so every query keeps
-    getting gradient (needed from scratch). 'hard': only existing primitives (for warm starts).
+    exist_mode 'detach' (default): existence weights both Chamfer directions (every query keeps
+    getting gradient from scratch) but as a constant; it is trained only by L_exist, i.e. to say
+    which primitives are used (closest to > 24 of 4096 points), which is what the eval keeps.
+    'soft': existence also gets the Chamfer gradient. That inverts it (runs/chair_L1_cd, 2026-11-17):
+    a low existence barely discounts a primitive in the point->SQ assignment (log p) but discounts
+    its SQ->point error, so the big covering parts went to p ~ 0.1 and the tiny unused ones to
+    p ~ 0.8; L_exist (w 0.01) could not hold against it. 'hard': only existing primitives (warm starts).
     rigid_term (SuperFlex L_rigid, Sec. 4.3): the same Chamfer with tapering / bending switched
     off, as a shape prior that makes the coarse rigid structure converge first.
     Distances in the normalized frame (object in a unit cube, SuperDec: sphere of radius 0.5)."""
@@ -190,6 +197,8 @@ def chamfer_loss(pred: dict, tgt: dict, w: dict, exist_mode: str = "soft", n_sam
     else:
         active = None
         weight = torch.sigmoid(pred["exist_logit"])
+        if exist_mode == "detach":
+            weight = weight.detach()
         log_e = torch.log(weight.clamp_min(1e-6))[..., None]
 
     p2sq, sq2p, assign, d_pt = _chamfer_terms(sq, surf, log_e, weight, n_samples, tau)
