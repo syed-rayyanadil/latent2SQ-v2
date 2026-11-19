@@ -138,7 +138,7 @@ def grid_faces(n_eta: int, n_omega: int, device=None) -> torch.Tensor:
 
 
 def sample_surface_uniform(scale, eps, R, t, n: int, taper=None, bend=None, alpha=None,
-                           n_eta: int = 24, n_omega: int = 48) -> torch.Tensor:
+                           n_eta: int = 24, n_omega: int = 48, generator=None) -> torch.Tensor:
     """n points per superquadric, evenly spread over its (deformed) surface area, differentiable.
 
     The parameter grid alone is not even (points bunch up at the poles and box edges), so: build
@@ -152,8 +152,8 @@ def sample_surface_uniform(scale, eps, R, t, n: int, taper=None, bend=None, alph
     tri = g[:, faces]                                                                   # (Q, F, 3, 3)
     with torch.no_grad():
         area = torch.linalg.cross(tri[:, :, 1] - tri[:, :, 0], tri[:, :, 2] - tri[:, :, 0]).norm(dim=-1)
-        idx = torch.multinomial(area + 1e-12, n, replacement=True)                      # (Q, n)
-        u, v = torch.rand(2, *idx.shape, 1, device=g.device)
+        idx = torch.multinomial(area + 1e-12, n, replacement=True, generator=generator) # (Q, n)
+        u, v = torch.rand(2, *idx.shape, 1, device=g.device, generator=generator)
         flip = (u + v) > 1                                                              # fold into the triangle
         u, v = torch.where(flip, 1 - u, u), torch.where(flip, 1 - v, v)
     t3 = torch.gather(tri, 1, idx[..., None, None].expand(-1, -1, 3, 3))                # (Q, n, 3, 3)

@@ -6,7 +6,10 @@ Run from the repo root (GPU):
     python -m l2sq.diagnose runs/chair_L1_cd --split dataset/chair/test -n 1 8
 
 Prints for one split (random views, like the eval):
-  1. the loss terms in eval mode (compare with the last train_loss values)
+  1. the loss terms in eval mode (compare with the last train_loss values), and the same loss
+     for the pseudo-GT superquadrics in the same samples: if the pseudo-GT scores lower, the loss
+     prefers the better decomposition and the decoder is stuck in a local minimum (optimization
+     problem); if it scores higher, the loss itself prefers what the decoder found
   2. per query: existence p, usage (share of GT points it is the closest primitive to),
      sq->points distance (how far its own surface is from the GT points), largest half-axis
   3. chamfer-gt / acc / comp / IoU for several choices of the kept primitives:
@@ -68,6 +71,7 @@ def main(argv: list[str] | None = None) -> None:
           f"N in {a.n}, {a.samples} view sets each", file=sys.stderr)
 
     parts_sum: dict[str, list] = {}
+    parts_gt: dict[str, list] = {}
     q = {k: [] for k in ("p", "usage", "sq2p", "size")}           # per sample (P,)
     rows = {k: {m: [] for m in ("chamfer", "acc", "comp", "iou", "count")} for k in ("p>0.5", "all", "used")}
     for n in a.n:
@@ -79,6 +83,11 @@ def main(argv: list[str] | None = None) -> None:
             _, parts = compute_loss(pred, tgt, cfg)
             for k, v in parts.items():
                 parts_sum.setdefault(k, []).append(v)
+            gt_pred = {k: tgt[k] for k in ("t", "R", "scale", "eps", "taper", "bend", "alpha") if k in tgt}
+            gt_pred["exist_logit"] = torch.where(tgt["exist"] > 0.5, 10.0, -10.0)
+            _, parts_g = compute_loss(gt_pred, tgt, {**cfg, "w_mse": 0.0})
+            for k, v in parts_g.items():
+                parts_gt.setdefault(k, []).append(v)
 
             s = tgt["s"]                                                            # (B,)
             pts = sample_surface_uniform(pred["scale"], pred["eps"], pred["R"], pred["t"], a.sq_samples,
@@ -109,8 +118,11 @@ def main(argv: list[str] | None = None) -> None:
             q["sq2p"].append((d_sq.mean(-1) * s[:, None]).cpu())
             q["size"].append((pred["scale"].amax(-1) * s[:, None]).cpu())
 
+    w = cfg["w"]
+    total = lambda d: sum(w.get(k, 0.0) * np.mean(v) for k, v in d.items() if k in w)
     print("\n1. loss terms (eval mode, mean over batches):")
-    print("   " + "  ".join(f"{k} {np.mean(v):.4g}" for k, v in parts_sum.items()))
+    print(f"   decoder    total {total(parts_sum):.4f}  " + "  ".join(f"{k} {np.mean(v):.4g}" for k, v in parts_sum.items()))
+    print(f"   pseudo-GT  total {total(parts_gt):.4f}  " + "  ".join(f"{k} {np.mean(v):.4g}" for k, v in parts_gt.items()))
 
     qs = {k: torch.cat(v).mean(0) for k, v in q.items()}
     on = torch.cat(q["p"]) > 0.5

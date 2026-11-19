@@ -40,7 +40,7 @@ import torch.nn.functional as F
 from l2sq.data import GeomTargets, GTSuperquadrics, ViewPool, collate, make_sample, random_views
 from l2sq.geom_loss import chamfer_loss, occupancy_iou, superflex_loss
 from l2sq.model import FrozenVGGT, SQDecoder
-from l2sq.sq import chamfer, geodesic_deg, sample_surface, sq_mesh
+from l2sq.sq import chamfer, geodesic_deg, sample_surface_uniform, sq_mesh
 
 EVAL_NS = (1, 2, 4, 8)
 
@@ -130,6 +130,12 @@ def sq_args(d: dict, b: int, sel, s: float = 1.0) -> tuple:
     return (d["scale"][b][sel] * s, d["eps"][b][sel], d["R"][b][sel], d["t"][b][sel] * s, 16, 32, *deform)
 
 
+def even_points(d: dict, b: int, sel, gen: torch.Generator, n: int = 512) -> torch.Tensor:
+    """n points per kept superquadric, spread evenly by area (as recon.eval_sq / l2sq.diagnose)."""
+    sc, ep, R, t, _, _, ta, be, al = sq_args(d, b, sel)
+    return sample_surface_uniform(sc, ep, R, t, n, ta, be, al, generator=gen).reshape(-1, 3)
+
+
 @torch.no_grad()
 def evaluate(vggt, dec, pool, samples_by_n, P, batch, device, cfg: dict, geom: GeomTargets) -> dict:
     """Parameter errors are per GT slot (query m vs GT superquadric m): meaningful for --loss mse
@@ -138,6 +144,7 @@ def evaluate(vggt, dec, pool, samples_by_n, P, batch, device, cfg: dict, geom: G
     dec.eval()
     out = {}
     rng = np.random.default_rng(1234)   # same GT point subsets at every evaluation
+    gen = torch.Generator(device=device).manual_seed(1234)   # same SQ surface samples, training RNG untouched
     for n, samples in samples_by_n.items():
         acc = {k: [] for k in ["loss", "rot_deg", "t_err_world", "scale_rel_err", "eps_err",
                                "exist_acc", "n_pred", "chamfer_world", "iou", "chamfer_gt", "iou_target"]}
@@ -163,8 +170,8 @@ def evaluate(vggt, dec, pool, samples_by_n, P, batch, device, cfg: dict, geom: G
             acc["n_pred"] += exist_pred.sum(-1).float().tolist()
             for b in range(len(chunk)):
                 keep = exist_pred[b] if exist_pred[b].any() else m[b]
-                p_pts = sample_surface(*sq_args(pred, b, keep)).reshape(-1, 3)
-                g_pts = sample_surface(*sq_args(tgt, b, m[b])).reshape(-1, 3)
+                p_pts = even_points(pred, b, keep, gen)
+                g_pts = even_points(tgt, b, m[b], gen)
                 acc["chamfer_world"].append(float(chamfer(p_pts, g_pts) * tgt["s"][b]))
                 acc["chamfer_gt"].append(float(chamfer(p_pts, tgt["surf"][b]) * tgt["s"][b]))
             keep_all = torch.where(exist_pred.any(-1, keepdim=True), exist_pred, m)
