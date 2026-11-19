@@ -262,6 +262,11 @@ def main(argv: list[str] | None = None) -> None:
                    help="--deform: tapering/bending forced to 0 in the loss until this step (rigid first)")
     p.add_argument("--n-sq-samples", type=int, default=256, help="--loss chamfer: surface points per superquadric")
     p.add_argument("--tau-assign", type=float, default=0.01, help="soft point-to-primitive assignment temperature")
+    p.add_argument("--tau-start", type=float, default=None,
+                   help="--loss chamfer: start the assignment temperature here and lower it geometrically to "
+                        "--tau-assign over --tau-anneal steps (soft early = every primitive feels distant "
+                        "points, as in deterministic annealing; against parts merged into one box)")
+    p.add_argument("--tau-anneal", type=int, default=1500, help="steps of the --tau-start schedule")
     p.add_argument("--w-iou", type=float, default=0.2, help="--loss superflex weights (SuperFlex train.yaml)")
     p.add_argument("--w-sdf", type=float, default=0.2)
     p.add_argument("--w-overlap", type=float, default=5.0)
@@ -377,6 +382,9 @@ def main(argv: list[str] | None = None) -> None:
         pred = dec(vggt(tgt["images"]))
         if a.deform and step <= a.deform_start:      # rigid phase: deformation outputs get no gradient
             pred = {**pred, "taper": torch.zeros_like(pred["taper"]), "bend": torch.zeros_like(pred["bend"])}
+        if a.tau_start is not None:   # geometric from tau_start to tau_assign, then constant
+            frac = min(1.0, (step - 1) / max(1, a.tau_anneal))
+            cfg["tau_assign"] = a.tau_start * (a.tau_assign / a.tau_start) ** frac
         loss, parts = compute_loss(pred, tgt, cfg)
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -399,6 +407,8 @@ def main(argv: list[str] | None = None) -> None:
                 for k, v in running.items():
                     tb.add_scalar(f"train_loss/{k}", v / a.log_every, step)
                 tb.add_scalar("misc/lr", sched.get_last_lr()[0], step)
+                if a.loss == "chamfer":
+                    tb.add_scalar("misc/tau_assign", cfg["tau_assign"], step)
                 tb.add_scalar("misc/sec_per_step", sec, step)
                 tb.add_scalar("misc/gpu_peak_gb", mem, step)
             running, t0 = {}, time.time()
