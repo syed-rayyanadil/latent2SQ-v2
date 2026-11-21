@@ -22,9 +22,9 @@ from pathlib import Path
 
 import torch
 
-from l2sq.data import GTSuperquadrics, ViewPool, make_sample
+from l2sq.data import GeomTargets, GTSuperquadrics, ViewPool, make_sample
 from l2sq.model import FrozenVGGT, SQDecoder
-from l2sq.train import evaluate, export_examples
+from l2sq.train import evaluate, export_examples, loss_config
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -40,14 +40,17 @@ def main(argv: list[str] | None = None) -> None:
     run, split = Path(a.run), Path(a.split)
     ckpt = torch.load(run / "decoder.pt", map_location="cpu")
     args = ckpt["args"]
-    dec = SQDecoder(args["d_model"], args["queries"], args["layers"], args["heads"], args["ffn"])
+    deform = args.get("deform", False)
+    dec = SQDecoder(args["d_model"], args["queries"], args["layers"], args["heads"], args["ffn"], deform=deform)
     dec.load_state_dict(ckpt["decoder"])
     dec.to(a.device).eval()
     vggt = FrozenVGGT(args["vggt_layer"]).to(a.device)
 
     pool = ViewPool(split)
-    gt = GTSuperquadrics(a.gt_sq or args["gt_sq"])
-    w = {"t": args["w_t"], "R": args["w_R"], "scale": args["w_scale"], "eps": args["w_eps"], "exist": args["w_exist"]}
+    gt = GTSuperquadrics(a.gt_sq or args["gt_sq"], deform=deform)
+    cfg = loss_config(args)
+    gt_world = args.get("gt_world") or str(Path(args["train"]).parent / "gt_world.npz")
+    geom = GeomTargets(gt_world, Path(args["train"]) / "cameras.json")
     out_dir = run / "predict"
     print(f"decoder from {run} (step {ckpt['step']}), trained on N in [{args['n_min']}, {args['n_max']}]",
           file=sys.stderr)
@@ -57,13 +60,12 @@ def main(argv: list[str] | None = None) -> None:
             sys.exit(f"-n {n} > {len(pool)} views in {split}")
         smp = make_sample(pool, gt, list(range(n)))
         export_examples(vggt, dec, pool, [smp], split.name, args["queries"], a.device, out_dir)
-        r = evaluate(vggt, dec, pool, {n: [smp]}, args["queries"], 1, a.device, w,
-                     args.get("scale_loss", "linear"))[f"N{n}"]
+        r = evaluate(vggt, dec, pool, {n: [smp]}, args["queries"], 1, a.device, cfg, geom)[f"N{n}"]
         d = out_dir / f"{split.name}_N{n}_0"
         (d / "metrics.json").write_text(json.dumps(r, indent=2))
         peak = torch.cuda.max_memory_allocated() / 2**30 if a.device == "cuda" else 0.0
         print(f"N={n:2d}: rot {r['rot_deg']:.1f}deg  t {r['t_err_world']:.4f}  scale {100 * r['scale_rel_err']:.1f}%  "
-              f"chamfer {r['chamfer_world']:.4f}  #SQ {r['n_pred']:.0f}  (peak GPU {peak:.1f} GB)\n"
+              f"chamfer {r['chamfer_world']:.4f}  IoU {r['iou']:.3f}  chamfer-gt {r['chamfer_gt']:.4f}  #SQ {r['n_pred']:.0f}  (peak GPU {peak:.1f} GB)\n"
               f"  view: python -m recon.view {split} --mesh {d / 'pred_sq.ply'}", file=sys.stderr)
 
 
