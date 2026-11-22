@@ -38,6 +38,7 @@ import torch
 import torch.nn.functional as F
 
 from l2sq.data import GeomTargets, GTSuperquadrics, ViewPool, collate, make_sample, random_views
+from l2sq.flow_matching_decoder import FlowSQDenoiser, decode_sq, flow_group_stats, flow_loss, pack_sq, sample_euler
 from l2sq.geom_loss import chamfer_loss, occupancy_iou, superflex_loss
 from l2sq.model import FrozenVGGT, SQDecoder
 from l2sq.sq import chamfer, geodesic_deg, sample_surface_uniform, sq_mesh
@@ -136,6 +137,11 @@ def even_points(d: dict, b: int, sel, gen: torch.Generator, n: int = 512) -> tor
     return sample_surface_uniform(sc, ep, R, t, n, ta, be, al, generator=gen).reshape(-1, 3)
 
 
+def _nanmean(vals: list[float]) -> float:
+    arr = np.asarray(vals, dtype=np.float64)
+    return float(np.nanmean(arr)) if np.isfinite(arr).any() else float("nan")
+
+
 @torch.no_grad()
 def evaluate(vggt, dec, pool, samples_by_n, P, batch, device, cfg: dict, geom: GeomTargets) -> dict:
     """Parameter errors are per GT slot (query m vs GT superquadric m): meaningful for --loss mse
@@ -148,13 +154,19 @@ def evaluate(vggt, dec, pool, samples_by_n, P, batch, device, cfg: dict, geom: G
     for n, samples in samples_by_n.items():
         acc = {k: [] for k in ["loss", "rot_deg", "t_err_world", "scale_rel_err", "eps_err",
                                "exist_acc", "n_pred", "chamfer_world", "iou", "chamfer_gt", "iou_target"]}
+        n_empty = 0
         if dec.deform:
             acc.update(taper_err=[], bend_err=[])
         for i in range(0, len(samples), batch):
             chunk = samples[i:i + batch]
             tgt = collate(pool, chunk, P, device, geom, rng, cfg.get("n_surf", 4096), cfg.get("n_vol", 32768))
-            pred = dec(vggt(tgt["images"]))
-            loss, _ = compute_loss(pred, tgt, cfg)
+            tokens = vggt(tgt["images"])
+            if cfg.get("decoder", "parallel") == "flow":
+                pred = decode_sq(sample_euler(dec, tokens, n_queries=P, n_steps=cfg.get("flow_steps", 20), generator=gen))
+                loss, _ = flow_loss(dec, tokens, tgt, generator=gen)
+            else:
+                pred = dec(tokens)
+                loss, _ = compute_loss(pred, tgt, cfg)
             acc["loss"].append(float(loss))
             m = tgt["exist"] > 0.5
             s = tgt["s"][:, None]
@@ -169,26 +181,38 @@ def evaluate(vggt, dec, pool, samples_by_n, P, batch, device, cfg: dict, geom: G
             acc["exist_acc"] += (exist_pred == m).float().mean(-1).tolist()
             acc["n_pred"] += exist_pred.sum(-1).float().tolist()
             for b in range(len(chunk)):
-                keep = exist_pred[b] if exist_pred[b].any() else m[b]
-                p_pts = even_points(pred, b, keep, gen)
-                g_pts = even_points(tgt, b, m[b], gen)
-                acc["chamfer_world"].append(float(chamfer(p_pts, g_pts) * tgt["s"][b]))
-                acc["chamfer_gt"].append(float(chamfer(p_pts, tgt["surf"][b]) * tgt["s"][b]))
-            keep_all = torch.where(exist_pred.any(-1, keepdim=True), exist_pred, m)
-            acc["iou"] += occupancy_iou(pred, tgt, keep_all).tolist()
+                if exist_pred[b].any():
+                    p_pts = even_points(pred, b, exist_pred[b], gen)
+                    g_pts = even_points(tgt, b, m[b], gen)
+                    acc["chamfer_world"].append(float(chamfer(p_pts, g_pts) * tgt["s"][b]))
+                    acc["chamfer_gt"].append(float(chamfer(p_pts, tgt["surf"][b]) * tgt["s"][b]))
+                else:
+                    n_empty += 1
+                    acc["chamfer_world"].append(float("nan"))
+                    acc["chamfer_gt"].append(float("nan"))
+            acc["iou"] += occupancy_iou(pred, tgt, exist_pred).tolist()
             acc["iou_target"] += occupancy_iou(tgt, tgt, m).tolist()   # pseudo-GT itself: checks labels + distances
-        out[f"N{n}"] = {k: float(np.mean(v)) for k, v in acc.items()}
-    out["all"] = {k: float(np.mean([out[f"N{n}"][k] for n in samples_by_n])) for k in next(iter(out.values()))}
+        out[f"N{n}"] = {**{k: _nanmean(v) for k, v in acc.items()}, "n_empty": n_empty}
+    keys = [k for k in next(iter(out.values())) if k != "n_empty"]
+    out["all"] = {
+        **{k: _nanmean([out[f"N{n}"][k] for n in samples_by_n]) for k in keys},
+        "n_empty": sum(out[f"N{n}"]["n_empty"] for n in samples_by_n),
+    }
     dec.train()
     return out
 
 
 @torch.no_grad()
-def export_examples(vggt, dec, pool, samples, split, P, device, folder: Path):
+def export_examples(vggt, dec, pool, samples, split, P, device, folder: Path,
+                    decoder: str = "parallel", flow_steps: int = 20):
     dec.eval()
+    gen = torch.Generator(device=device).manual_seed(1234)
     for k, smp in enumerate(samples):
         tgt = collate(pool, [smp], P, device)
-        pred = {key: v.cpu() for key, v in dec(vggt(tgt["images"])).items()}
+        tokens = vggt(tgt["images"])
+        raw_pred = (decode_sq(sample_euler(dec, tokens, n_queries=P, n_steps=flow_steps, generator=gen))
+                    if decoder == "flow" else dec(tokens))
+        pred = {key: v.cpu() for key, v in raw_pred.items()}
         tgt = {key: (v.cpu() if isinstance(v, torch.Tensor) else v) for key, v in tgt.items()}
         s = smp.scale_s
         d = folder / f"{split}_N{len(smp.views)}_{k}"
@@ -232,6 +256,8 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--heads", type=int, default=8)
     p.add_argument("--ffn", type=int, default=1024)
     p.add_argument("--vggt-layer", type=int, default=23, help="aggregator layer (4, 11, 17 or 23)")
+    p.add_argument("--decoder", choices=["parallel", "flow"], default="parallel", help="parallel SQDecoder or flow-matching denoiser")
+    p.add_argument("--flow-steps", type=int, default=20, help="Euler ODE steps when --decoder flow")
     # optimization
     p.add_argument("--steps", type=int, default=3000)
     p.add_argument("--batch", type=int, default=2, help="samples per step (each N views)")
@@ -308,7 +334,10 @@ def main(argv: list[str] | None = None) -> None:
         a.gt_world = str(Path(a.train).parent / "gt_world.npz")
     a.exist_mode = loss_config(vars(a))["exist_mode"]     # store the resolved default with the run
     (out / "args.json").write_text(json.dumps(vars(a), indent=2))
-    cfg = {**loss_config(vars(a)), "n_surf": a.n_surf, "n_vol": a.n_vol}
+    cfg = {**loss_config(vars(a)), "n_surf": a.n_surf, "n_vol": a.n_vol,
+           "decoder": a.decoder, "flow_steps": a.flow_steps}
+    if a.decoder == "flow" and a.deform:
+        sys.exit("--decoder flow supports rigid 15-dim SQs only (omit --deform).")
 
     print("loading views and pseudo-GT ...", file=sys.stderr)
     train_pool, test_pool = ViewPool(a.train), ViewPool(a.test)
@@ -324,7 +353,12 @@ def main(argv: list[str] | None = None) -> None:
     }
 
     vggt = FrozenVGGT(a.vggt_layer).to(device)
-    dec = SQDecoder(a.d_model, a.queries, a.layers, a.heads, a.ffn, deform=a.deform).to(device)
+    if a.decoder == "flow":
+        s0 = collate(train_pool, [make_sample(train_pool, gt, [0])], a.queries, "cpu")
+        print(f"flow x_1 raw min/max: {flow_group_stats(pack_sq(s0, normalize=False), s0['exist'])}", file=sys.stderr)
+        dec = FlowSQDenoiser(a.d_model, a.queries, a.layers, a.heads, a.ffn).to(device)
+    else:
+        dec = SQDecoder(a.d_model, a.queries, a.layers, a.heads, a.ffn, deform=a.deform).to(device)
     print(f"decoder parameters: {sum(p.numel() for p in dec.parameters()) / 1e6:.2f} M", file=sys.stderr)
     if a.init:
         ckpt = torch.load(a.init, map_location="cpu")
@@ -367,42 +401,59 @@ def main(argv: list[str] | None = None) -> None:
                   f"t {r['t_err_world']:.4f}  scale {100 * r['scale_rel_err']:.1f}%  "
                   f"chamfer {r['chamfer_world']:.4f}  IoU {r['iou']:.3f}  chamfer-gt {r['chamfer_gt']:.4f}  "
                   f"exist-acc {r['exist_acc']:.3f}  IoU-target {r['iou_target']:.3f}  "
-                  f"#SQ {r['n_pred']:.1f}/{len(gt)}", file=sys.stderr)
+                  f"#SQ {r['n_pred']:.1f}/{len(gt)}  empty {r['n_empty']}", file=sys.stderr)
         if step > 0:
             torch.save({"decoder": dec.state_dict(), "args": vars(a), "step": step}, out / "decoder.pt")
 
     if a.init:   # starting point of the fine-tuning
         run_eval(0)
 
+    def _sync():
+        if device == "cuda":
+            torch.cuda.synchronize()
+
     running, t0 = {}, time.time()
+    t_vggt, t_dec = 0.0, 0.0
     for step in range(1, a.steps + 1):
         n = int(rng.integers(a.n_min, a.n_max + 1))
         batch = [make_sample(train_pool, gt, random_views(rng, len(train_pool), n)) for _ in range(a.batch)]
         tgt = collate(train_pool, batch, a.queries, device, geom, rng, a.n_surf, a.n_vol)
-        pred = dec(vggt(tgt["images"]))
-        if a.deform and step <= a.deform_start:      # rigid phase: deformation outputs get no gradient
-            pred = {**pred, "taper": torch.zeros_like(pred["taper"]), "bend": torch.zeros_like(pred["bend"])}
-        if a.tau_start is not None:   # geometric from tau_start to tau_assign, then constant
-            frac = min(1.0, (step - 1) / max(1, a.tau_anneal))
-            cfg["tau_assign"] = a.tau_start * (a.tau_assign / a.tau_start) ** frac
-        loss, parts = compute_loss(pred, tgt, cfg)
+        _sync()
+        tv0 = time.perf_counter()
+        tokens = vggt(tgt["images"])
+        _sync()
+        td0 = time.perf_counter()
+        t_vggt += td0 - tv0
+        if a.decoder == "flow":
+            loss, parts = flow_loss(dec, tokens, tgt)
+        else:
+            pred = dec(tokens)
+            if a.deform and step <= a.deform_start:      # rigid phase: deformation outputs get no gradient
+                pred = {**pred, "taper": torch.zeros_like(pred["taper"]), "bend": torch.zeros_like(pred["bend"])}
+            if a.tau_start is not None:   # geometric from tau_start to tau_assign, then constant
+                frac = min(1.0, (step - 1) / max(1, a.tau_anneal))
+                cfg["tau_assign"] = a.tau_start * (a.tau_assign / a.tau_start) ** frac
+            loss, parts = compute_loss(pred, tgt, cfg)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(dec.parameters(), 1.0)
         opt.step()
         sched.step()
+        _sync()
+        t_dec += time.perf_counter() - td0
 
         for k, v in {"loss": loss.item(), **parts}.items():
             running[k] = running.get(k, 0.0) + v
         if step % a.log_every == 0:
             msg = "  ".join(f"{k} {v / a.log_every:.4g}" for k, v in running.items())
             sec = (time.time() - t0) / a.log_every
+            tv, td = t_vggt / a.log_every, t_dec / a.log_every
             # peak memory actually used by tensors in this interval (nvidia-smi shows PyTorch's cache instead)
             mem = torch.cuda.max_memory_allocated() / 2**30 if device == "cuda" else 0.0
             if device == "cuda":
                 torch.cuda.reset_peak_memory_stats()
             print(f"step {step:5d}  {msg}  lr {sched.get_last_lr()[0]:.2e}  {sec:.2f}s/step  "
-                  f"peak {mem:.1f} GB", file=sys.stderr)
+                  f"vggt {tv:.3f}s/step  dec {td:.3f}s/step  peak {mem:.1f} GB", file=sys.stderr)
             if tb is not None:
                 for k, v in running.items():
                     tb.add_scalar(f"train_loss/{k}", v / a.log_every, step)
@@ -410,16 +461,21 @@ def main(argv: list[str] | None = None) -> None:
                 if a.loss == "chamfer":
                     tb.add_scalar("misc/tau_assign", cfg["tau_assign"], step)
                 tb.add_scalar("misc/sec_per_step", sec, step)
+                tb.add_scalar("misc/sec_vggt", tv, step)
+                tb.add_scalar("misc/sec_dec", td, step)
                 tb.add_scalar("misc/gpu_peak_gb", mem, step)
             running, t0 = {}, time.time()
+            t_vggt, t_dec = 0.0, 0.0
 
         if step % a.eval_every == 0 or step == a.steps:
             run_eval(step)
             t0 = time.time()
+            t_vggt, t_dec = 0.0, 0.0
 
     for split, (pool, samples) in eval_sets.items():
         for n in (1, 8):
-            export_examples(vggt, dec, pool, samples[n][:a.examples], split, a.queries, device, out / "examples")
+            export_examples(vggt, dec, pool, samples[n][:a.examples], split, a.queries, device, out / "examples",
+                            decoder=a.decoder, flow_steps=a.flow_steps)
     final = {split: res[split] for split in eval_sets}
     (out / "eval_final.json").write_text(json.dumps(final, indent=2))
     print("\nfinal (per N):", file=sys.stderr)
