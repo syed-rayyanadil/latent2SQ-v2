@@ -161,7 +161,70 @@ def test_train_py_flow_wiring() -> None:
         print(f"empty-pred eval check: n_empty={r_empty['all']['n_empty']}, chamfer={r_empty['all']['chamfer_world']}")
 
 
+def test_flow_repeat() -> None:
+    torch.manual_seed(0)
+    B, P, M = 2, 16, 7
+    tgt = _fake_tgt(B, P, M)
+    tokens = torch.randn(B, 2, 8, TOKEN_DIM)
+    denoiser = FlowSQDenoiser(d_model=64, n_queries=P, n_layers=2, n_heads=4, ffn_dim=128)
+
+    # 1. K=1 matches reference unrepeated flow_loss bit-for-bit with fixed seed
+    g1 = torch.Generator().manual_seed(99)
+    loss_k1, parts_k1 = flow_loss(denoiser, tokens, tgt, generator=g1, repeat=1)
+    g_ref = torch.Generator().manual_seed(99)
+    x_1 = pack_sq(tgt)
+    x_0 = torch.randn(x_1.shape, generator=g_ref)
+    t_ref = torch.rand(B, generator=g_ref)
+    v_ref = denoiser(t_ref[:, None, None] * x_1 + (1.0 - t_ref[:, None, None]) * x_0, t_ref, tokens=tokens)
+    err2 = (v_ref - (x_1 - x_0)) ** 2
+    m = tgt["exist"]
+    loss_ref = sum((err2[..., sl].mean(-1) * m).sum() / m.sum() for sl in
+                   [slice(0, 3), slice(3, 9), slice(9, 12), slice(12, 14)]) + err2[..., 14].mean()
+    assert torch.allclose(loss_k1, loss_ref, atol=1e-6), f"{loss_k1} vs {loss_ref}"
+
+    # 2. K=4 encodes tokens once, expands batch to B*4 with independent t/x_0, finite loss
+    seen = []
+    orig_encode = denoiser.encode_tokens
+    orig_forward = denoiser.forward
+    encode_calls = 0
+
+    def spy_encode(tok):
+        nonlocal encode_calls
+        encode_calls += 1
+        return orig_encode(tok)
+
+    def spy_forward(x_t, t, tokens=None, mem=None, n_views=None):
+        seen.append((x_t.shape, t.shape, mem.shape, t.detach().clone(), x_t.detach().clone()))
+        return orig_forward(x_t, t, tokens=tokens, mem=mem, n_views=n_views)
+
+    with patch.object(denoiser, "encode_tokens", side_effect=spy_encode), \
+         patch.object(denoiser, "forward", side_effect=spy_forward):
+        loss_k4, parts_k4 = flow_loss(denoiser, tokens, tgt, generator=torch.Generator().manual_seed(123), repeat=4)
+    assert encode_calls == 1
+    x_shape, t_shape, mem_shape, t_seen, x_t_seen = seen[0]
+    assert x_shape == (B * 4, P, 15) and t_shape == (B * 4,) and mem_shape == (B * 4, 2 * 8, 64)
+    assert len(torch.unique(t_seen)) == B * 4
+    assert not torch.allclose(x_t_seen[0], x_t_seen[1])
+    assert torch.isfinite(loss_k4) and all(np.isfinite(v) for v in parts_k4.values())
+
+    # 3. Short single-batch overfit with K=4 converges
+    print("\n=== Single-batch overfit with K=4 (200 steps) ===")
+    opt = torch.optim.AdamW(denoiser.parameters(), lr=2e-3)
+    hist = []
+    for step in range(1, 201):
+        loss, parts = flow_loss(denoiser, tokens, tgt, repeat=4)
+        opt.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(denoiser.parameters(), 1.0)
+        opt.step()
+        hist.append(loss.item())
+        if step == 1 or step % 50 == 0:
+            print(f"  step {step:3d}: loss={loss.item():.4f}  exist={parts['exist']:.4f}")
+    assert sum(hist[-10:]) / 10 < sum(hist[:10]) / 10 * 0.25
+
+
 if __name__ == "__main__":
     test_overfit_one_batch()
+    test_flow_repeat()
     test_train_py_flow_wiring()
     print("\nALL CPU FLOW TESTS PASSED")

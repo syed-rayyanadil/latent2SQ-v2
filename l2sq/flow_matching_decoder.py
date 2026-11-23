@@ -146,15 +146,22 @@ class FlowSQDenoiser(nn.Module):
 
 
 def flow_loss(denoiser: FlowSQDenoiser, tokens: torch.Tensor, tgt: dict,
-              generator: torch.Generator | None = None) -> tuple[torch.Tensor, dict]:
+              generator: torch.Generator | None = None, repeat: int = 1) -> tuple[torch.Tensor, dict]:
     """CondOT velocity MSE: active slots for SQ params, all P slots for existence."""
+    if repeat < 1:
+        raise ValueError(f"repeat must be >= 1, got {repeat}")
+    mem, n_views = denoiser.encode_tokens(tokens)
     x_1 = pack_sq(tgt)
+    m = tgt["exist"]
+    if repeat > 1:
+        mem = mem.repeat_interleave(repeat, dim=0)
+        x_1 = x_1.repeat_interleave(repeat, dim=0)
+        m = m.repeat_interleave(repeat, dim=0)
     x_0 = torch.randn(x_1.shape, device=x_1.device, dtype=x_1.dtype, generator=generator)
     t = torch.rand(x_1.shape[0], device=x_1.device, dtype=x_1.dtype, generator=generator)
     x_t = t[:, None, None] * x_1 + (1.0 - t[:, None, None]) * x_0
-    v_pred = denoiser(x_t, t, tokens=tokens)
+    v_pred = denoiser(x_t, t, mem=mem, n_views=n_views)
     err2 = (v_pred - (x_1 - x_0)) ** 2
-    m = tgt["exist"]
     n = m.sum().clamp_min(1.0)
     parts = {k: (err2[..., sl].mean(-1) * m).sum() / n for k, sl in GROUP_SLICES.items() if k != "exist"}
     parts["exist"] = err2[..., 14].mean()
