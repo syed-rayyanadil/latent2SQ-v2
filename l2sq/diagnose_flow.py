@@ -13,6 +13,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from scipy.optimize import linear_sum_assignment
 
 from l2sq.data import GTSuperquadrics, ViewPool, collate
 from l2sq.flow_matching_decoder import (
@@ -189,6 +190,63 @@ def main(argv: list[str] | None = None) -> None:
         k_lo, k_hi = _minmax(s_act)
         print(f"   {label:9s}  GT [{g_lo:7.3f}, {g_hi:7.3f}]  |  "
               f"sampled(all) [{a_lo:7.3f}, {a_hi:7.3f}]  |  sampled(exist>0.5) [{k_lo:7.3f}, {k_hi:7.3f}]")
+
+    # 6. Translation (t) breakdown: per-slot table, mean offset, centered error, Hungarian matching, std
+    print("\n6. Translation (t) diagnosis in world-scale units (20-step samples vs GT):")
+
+    def _t_stats(t_gt: torch.Tensor, t_pred: torch.Tensor, gt_mask: torch.Tensor, pred_mask: torch.Tensor) -> dict:
+        g_act, p_on_gt = t_gt[gt_mask], t_pred[gt_mask]
+        diff = p_on_gt - g_act
+        mean_diff = diff.mean(dim=0)
+        err_idx = float(diff.norm(dim=-1).mean())
+        err_cent = float((diff - mean_diff).norm(dim=-1).mean())
+        p_act = t_pred[pred_mask]
+        if len(p_act) > 0 and len(g_act) > 0:
+            cost = torch.cdist(g_act, p_act).cpu().numpy()
+            ri, ci = linear_sum_assignment(cost)
+            err_hung = float(cost[ri, ci].mean())
+        else:
+            err_hung = float("nan")
+        gt_std = g_act.std(dim=0, unbiased=False)
+        pred_std = p_act.std(dim=0, unbiased=False) if len(p_act) > 1 else torch.zeros(3, device=t_pred.device)
+        return {
+            "diff": diff, "mean_diff": mean_diff, "mean_norm": float(mean_diff.norm()),
+            "err_idx": err_idx, "err_cent": err_cent, "err_hung": err_hung,
+            "gt_std": gt_std, "pred_std": pred_std, "n_pred_act": int(pred_mask.sum()),
+        }
+
+    def _print_sample_t(label: str, tgt: dict, pred: dict, b: int) -> None:
+        s = float(tgt["s"][b])
+        t_gt, t_pred = tgt["t"][b] * s, pred["t"][b] * s
+        gt_mask = tgt["exist"][b] > 0.5
+        pred_mask = torch.sigmoid(pred["exist_logit"][b]) > 0.5
+        st = _t_stats(t_gt, t_pred, gt_mask, pred_mask)
+        print(f"   [{label}] active GT={int(gt_mask.sum())}, pred={st['n_pred_act']}")
+        print("   slot |         GT t (x, y, z)         |        pred t (x, y, z)        |     diff (pred - GT)")
+        for slot in torch.nonzero(gt_mask, as_tuple=True)[0].tolist():
+            g, pr, d = t_gt[slot], t_pred[slot], t_pred[slot] - t_gt[slot]
+            print(f"   {slot:4d} | ({g[0]:6.3f}, {g[1]:6.3f}, {g[2]:6.3f}) | "
+                  f"({pr[0]:6.3f}, {pr[1]:6.3f}, {pr[2]:6.3f}) | ({d[0]:+6.3f}, {d[1]:+6.3f}, {d[2]:+6.3f})")
+        md, gs, ps = st["mean_diff"], st["gt_std"], st["pred_std"]
+        print(f"   mean(pred-GT)=({md[0]:+.3f}, {md[1]:+.3f}, {md[2]:+.3f}) norm={st['mean_norm']:.4f} | "
+              f"err: idx={st['err_idx']:.4f}, centered={st['err_cent']:.4f}, hung={st['err_hung']:.4f}")
+        print(f"   std(t) GT=({gs[0]:.3f}, {gs[1]:.3f}, {gs[2]:.3f})  "
+              f"pred=({ps[0]:.3f}, {ps[1]:.3f}, {ps[2]:.3f})")
+
+    n8_flat = [(tgt, pred, b) for tgt, _, pred in samples_20[8] for b in range(tgt["t"].shape[0])]
+    _print_sample_t("N=8 sample 0", *n8_flat[0])
+    if len(n8_flat) > 1:
+        _print_sample_t("N=8 sample 1 (diff views)", *n8_flat[1])
+
+    all_st = [
+        _t_stats(tgt["t"][b] * float(tgt["s"][b]), pred["t"][b] * float(tgt["s"][b]),
+                 tgt["exist"][b] > 0.5, torch.sigmoid(pred["exist_logit"][b]) > 0.5)
+        for n in (4, 8) for tgt, _, pred in samples_20[n] for b in range(tgt["t"].shape[0])
+    ]
+    print(f"   [all N=4,8 test set ({len(all_st)} samples)] mean_offset_norm={np.mean([r['mean_norm'] for r in all_st]):.4f} | "
+          f"err: idx={np.mean([r['err_idx'] for r in all_st]):.4f}, "
+          f"centered={np.mean([r['err_cent'] for r in all_st]):.4f}, "
+          f"hung={np.nanmean([r['err_hung'] for r in all_st]):.4f}")
 
 
 if __name__ == "__main__":
