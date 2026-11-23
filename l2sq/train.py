@@ -162,7 +162,8 @@ def evaluate(vggt, dec, pool, samples_by_n, P, batch, device, cfg: dict, geom: G
             tgt = collate(pool, chunk, P, device, geom, rng, cfg.get("n_surf", 4096), cfg.get("n_vol", 32768))
             tokens = vggt(tgt["images"])
             if cfg.get("decoder", "parallel") == "flow":
-                pred = decode_sq(sample_euler(dec, tokens, n_queries=P, n_steps=cfg.get("flow_steps", 20), generator=gen))
+                pred = decode_sq(sample_euler(dec, tokens, n_queries=P, n_steps=cfg.get("flow_steps", 20), generator=gen),
+                                 t_mean=dec.t_mean, t_std=dec.t_std)
                 loss, _ = flow_loss(dec, tokens, tgt, generator=gen)
             else:
                 pred = dec(tokens)
@@ -210,7 +211,8 @@ def export_examples(vggt, dec, pool, samples, split, P, device, folder: Path,
     for k, smp in enumerate(samples):
         tgt = collate(pool, [smp], P, device)
         tokens = vggt(tgt["images"])
-        raw_pred = (decode_sq(sample_euler(dec, tokens, n_queries=P, n_steps=flow_steps, generator=gen))
+        raw_pred = (decode_sq(sample_euler(dec, tokens, n_queries=P, n_steps=flow_steps, generator=gen),
+                              t_mean=dec.t_mean, t_std=dec.t_std)
                     if decoder == "flow" else dec(tokens))
         pred = {key: v.cpu() for key, v in raw_pred.items()}
         tgt = {key: (v.cpu() if isinstance(v, torch.Tensor) else v) for key, v in tgt.items()}
@@ -262,6 +264,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--flow-loss", choices=["velocity", "mix"], default="velocity",
                    help="velocity: CondOT velocity MSE; mix: + --w-x1 * t-weighted decoded x1 loss")
     p.add_argument("--w-x1", type=float, default=1.0, help="weight of x1 loss when --flow-loss mix")
+    p.add_argument("--flow-t-norm", action="store_true", help="per-axis (t - mean) / std normalization in flow space")
     # optimization
     p.add_argument("--steps", type=int, default=3000)
     p.add_argument("--batch", type=int, default=2, help="samples per step (each N views)")
@@ -361,6 +364,18 @@ def main(argv: list[str] | None = None) -> None:
         s0 = collate(train_pool, [make_sample(train_pool, gt, [0])], a.queries, "cpu")
         print(f"flow x_1 raw min/max: {flow_group_stats(pack_sq(s0, normalize=False), s0['exist'])}", file=sys.stderr)
         dec = FlowSQDenoiser(a.d_model, a.queries, a.layers, a.heads, a.ffn).to(device)
+        if a.flow_t_norm:
+            stat_rng = np.random.default_rng(a.seed + 999)
+            t_vals = []
+            for _ in range(64):
+                n = int(stat_rng.integers(a.n_min, a.n_max + 1))
+                b_smp = collate(train_pool, [make_sample(train_pool, gt, random_views(stat_rng, len(train_pool), n))],
+                                a.queries, "cpu")
+                t_vals.append(b_smp["t"][b_smp["exist"] > 0.5])
+            all_t = torch.cat(t_vals, dim=0)
+            t_mean, t_std = all_t.mean(dim=0), all_t.std(dim=0, unbiased=False).clamp_min(1e-6)
+            dec.set_t_norm(t_mean, t_std)
+            print(f"flow t_norm (64 train samples): mean={t_mean.tolist()}  std={t_std.tolist()}", file=sys.stderr)
     else:
         dec = SQDecoder(a.d_model, a.queries, a.layers, a.heads, a.ffn, deform=a.deform).to(device)
     print(f"decoder parameters: {sum(p.numel() for p in dec.parameters()) / 1e6:.2f} M", file=sys.stderr)

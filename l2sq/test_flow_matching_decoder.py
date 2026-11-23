@@ -143,6 +143,17 @@ def test_train_py_flow_wiring() -> None:
         assert "n_empty" in final["test"]["all"]
         assert (out / "decoder.pt").is_file()
 
+        out_tn = Path(tmp) / "run_tnorm"
+        train_mod.main([
+            "--train", "fake_train", "--test", "fake_test", "--gt-sq", "fake.npz",
+            "--out", str(out_tn), "--decoder", "flow", "--flow-t-norm", "--layers", "1", "--d-model", "64",
+            "--heads", "4", "--ffn", "128", "--steps", "1", "--log-every", "1",
+            "--eval-every", "1", "--eval-per-n", "1", "--examples", "1", "--batch", "2",
+            "--n-surf", "64", "--n-vol", "64", "--flow-steps", "4", "--device", "cpu", "--no-tb",
+        ])
+        ckpt_tn = torch.load(out_tn / "decoder.pt", map_location="cpu", weights_only=False)
+        assert not torch.allclose(ckpt_tn["decoder"]["t_mean"], torch.zeros(3))
+
         # Verify evaluate() counts empty predictions and uses nanmean safely
         class EmptyDec(torch.nn.Module):
             deform = False
@@ -262,9 +273,56 @@ def test_flow_loss_mix() -> None:
     assert sum(x[0] for x in hist[-10:]) / 10 < sum(x[0] for x in hist[:10]) / 10 * 0.25
 
 
+def test_flow_t_norm() -> None:
+    torch.manual_seed(0)
+    B, P, M = 2, 16, 7
+    tgt = _fake_tgt(B, P, M)
+    tokens = torch.randn(B, 2, 8, TOKEN_DIM)
+    t_mean = torch.tensor([0.1, -0.2, 1.0])
+    t_std = torch.tensor([0.3, 0.4, 0.5])
+
+    # 1. Default off (zeros/ones) is bit-for-bit identical to None
+    p_none = pack_sq(tgt)
+    p_def = pack_sq(tgt, t_mean=torch.zeros(3), t_std=torch.ones(3))
+    assert torch.equal(p_none, p_def)
+    d_none = decode_sq(p_none)
+    d_def = decode_sq(p_def, t_mean=torch.zeros(3), t_std=torch.ones(3))
+    assert all(torch.equal(d_none[k], d_def[k]) for k in d_none)
+
+    # 2. Pack/decode round trip with t_norm on (only t normalized; rest unchanged)
+    p_norm = pack_sq(tgt, t_mean=t_mean, t_std=t_std)
+    assert torch.allclose(p_norm[..., :3], (tgt["t"] - t_mean) / t_std, atol=1e-6)
+    assert torch.equal(p_norm[..., 3:], p_none[..., 3:])
+    rt = decode_sq(p_norm, t_mean=t_mean, t_std=t_std)
+    _assert_valid_sq(rt, B, P)
+    assert torch.allclose(rt["t"][:, :M], tgt["t"][:, :M], atol=1e-5)
+
+    # 3. Single-batch overfit with t_norm on (velocity + mix) & checkpoint buffer reload
+    denoiser = FlowSQDenoiser(d_model=64, n_queries=P, n_layers=2, n_heads=4, ffn_dim=128)
+    denoiser.set_t_norm(t_mean, t_std)
+    print("\n=== Single-batch overfit with --flow-t-norm on (200 steps) ===")
+    opt = torch.optim.AdamW(denoiser.parameters(), lr=2e-3)
+    hist = []
+    for step in range(1, 201):
+        loss, parts = flow_loss(denoiser, tokens, tgt, repeat=2, mode="mix", w_x1=1.0)
+        opt.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(denoiser.parameters(), 1.0)
+        opt.step()
+        hist.append(loss.item())
+        if step == 1 or step % 50 == 0:
+            print(f"  step {step:3d}: total={loss.item():.4f}  v_loss={parts['v_loss']:.4f}  x1_loss={parts['x1_loss']:.4f}")
+    assert sum(hist[-10:]) / 10 < sum(hist[:10]) / 10 * 0.25
+
+    reloaded = FlowSQDenoiser(d_model=64, n_queries=P, n_layers=2, n_heads=4, ffn_dim=128)
+    reloaded.load_state_dict(denoiser.state_dict())
+    assert torch.allclose(reloaded.t_mean, t_mean) and torch.allclose(reloaded.t_std, t_std)
+
+
 if __name__ == "__main__":
     test_overfit_one_batch()
     test_flow_repeat()
     test_flow_loss_mix()
+    test_flow_t_norm()
     test_train_py_flow_wiring()
     print("\nALL CPU FLOW TESTS PASSED")

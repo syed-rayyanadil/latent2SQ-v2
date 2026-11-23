@@ -23,29 +23,37 @@ def _shift_scale(like: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             torch.tensor(_SCALE, device=like.device, dtype=like.dtype))
 
 
-def pack_sq(tgt: dict, normalize: bool = True) -> torch.Tensor:
+def pack_sq(tgt: dict, normalize: bool = True,
+            t_mean: torch.Tensor | None = None, t_std: torch.Tensor | None = None) -> torch.Tensor:
     """Pack target dict -> unconstrained (B, P, 15) flow target x_1 (optionally group-normalized)."""
     R = tgt["R"]
+    t_val = tgt["t"]
+    if normalize and t_mean is not None and t_std is not None:
+        t_val = (t_val - t_mean.to(t_val)) / t_std.to(t_val).clamp_min(1e-6)
     rot6d = torch.cat([R[..., :, 0], R[..., :, 1]], dim=-1)
     log_scale = torch.log(tgt["scale"].clamp_min(SCALE_MIN))
     eps_u = ((tgt["eps"] - EPS_MIN) / (EPS_MAX - EPS_MIN)).clamp(1e-4, 1.0 - 1e-4)
-    raw = torch.cat([tgt["t"], rot6d, log_scale, torch.logit(eps_u), tgt["exist"].unsqueeze(-1)], dim=-1)
+    raw = torch.cat([t_val, rot6d, log_scale, torch.logit(eps_u), tgt["exist"].unsqueeze(-1)], dim=-1)
     if not normalize:
         return raw
     shift, scale = _shift_scale(raw)
     return (raw - shift) / scale
 
 
-def decode_sq(x: torch.Tensor, normalized: bool = True, smooth_exist: bool = False) -> dict:
+def decode_sq(x: torch.Tensor, normalized: bool = True, smooth_exist: bool = False,
+              t_mean: torch.Tensor | None = None, t_std: torch.Tensor | None = None) -> dict:
     """Convert flow sample (B, P, 15) back into valid SQ dict matching SQDecoder's output keys."""
     if normalized:
         shift, scale = _shift_scale(x)
         x = x * scale + shift
+    t_out = x[..., 0:3]
+    if normalized and t_mean is not None and t_std is not None:
+        t_out = t_out * t_std.to(x).clamp_min(1e-6) + t_mean.to(x)
     # In flow space, GT existence is 0 or 1 (threshold 0.5). For differentiable BCE in mix loss,
     # map (exist - 0.5) * 8.0 to an unbounded logit centered at 0.5 so gradients never vanish.
     exist_logit = (x[..., 14] - 0.5) * 8.0 if smooth_exist else torch.logit(x[..., 14].clamp(1e-4, 1.0 - 1e-4))
     return {
-        "t": x[..., 0:3],
+        "t": t_out,
         "R": rot6d_to_matrix(x[..., 3:9]),
         "scale": torch.exp(x[..., 9:12].clamp(-10.0, 4.0)).clamp_min(SCALE_MIN),
         "eps": EPS_MIN + (EPS_MAX - EPS_MIN) * torch.sigmoid(x[..., 12:14]),
@@ -129,6 +137,18 @@ class FlowSQDenoiser(nn.Module):
         self.out_proj = nn.Linear(d_model, SQ_DIM)
         self.x_skip = nn.Linear(SQ_DIM, SQ_DIM)
         self.t_scale = nn.Sequential(nn.SiLU(), nn.Linear(d_model, SQ_DIM))
+        self.register_buffer("t_mean", torch.zeros(3))
+        self.register_buffer("t_std", torch.ones(3))
+
+    def set_t_norm(self, mean: torch.Tensor, std: torch.Tensor) -> None:
+        with torch.no_grad():
+            self.t_mean.copy_(mean.to(device=self.t_mean.device, dtype=self.t_mean.dtype))
+            self.t_std.copy_(std.to(device=self.t_std.device, dtype=self.t_std.dtype).clamp_min(1e-6))
+
+    def load_state_dict(self, state_dict, *args, **kwargs):
+        if "t_mean" not in state_dict and "t_std" not in state_dict:
+            state_dict = {**state_dict, "t_mean": self.t_mean, "t_std": self.t_std}
+        return super().load_state_dict(state_dict, *args, **kwargs)
 
     def encode_tokens(self, tokens: torch.Tensor) -> tuple[torch.Tensor, int]:
         mem = self.in_proj(self.in_norm(tokens))
@@ -158,7 +178,7 @@ def flow_loss(denoiser: FlowSQDenoiser, tokens: torch.Tensor, tgt: dict,
     if mode not in ("velocity", "mix"):
         raise ValueError(f"unknown flow loss mode {mode!r}")
     mem, n_views = denoiser.encode_tokens(tokens)
-    x_1 = pack_sq(tgt)
+    x_1 = pack_sq(tgt, t_mean=denoiser.t_mean, t_std=denoiser.t_std)
     m = tgt["exist"]
     if repeat > 1:
         mem = mem.repeat_interleave(repeat, dim=0)
@@ -178,7 +198,7 @@ def flow_loss(denoiser: FlowSQDenoiser, tokens: torch.Tensor, tgt: dict,
 
     # Weight x1 parameter loss by t so noisy samples near t=0 (where x1_hat is unreliable) do not dominate.
     x1_hat = x_t + (1.0 - t[:, None, None]) * v_pred
-    pred_sq = decode_sq(x1_hat, normalized=True, smooth_exist=True)
+    pred_sq = decode_sq(x1_hat, normalized=True, smooth_exist=True, t_mean=denoiser.t_mean, t_std=denoiser.t_std)
     wt = t[:, None]
     rep = (lambda a: a.repeat_interleave(repeat, dim=0)) if repeat > 1 else (lambda a: a)
     x1_masked = lambda a, b: ((((a - b) ** 2).flatten(2).mean(-1) * wt) * m).sum() / n
