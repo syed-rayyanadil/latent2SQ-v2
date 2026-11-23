@@ -6,6 +6,7 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from l2sq.model import TOKEN_DIM
 from l2sq.sq import EPS_MAX, EPS_MIN, SCALE_MIN, rot6d_to_matrix
@@ -35,17 +36,20 @@ def pack_sq(tgt: dict, normalize: bool = True) -> torch.Tensor:
     return (raw - shift) / scale
 
 
-def decode_sq(x: torch.Tensor, normalized: bool = True) -> dict:
+def decode_sq(x: torch.Tensor, normalized: bool = True, smooth_exist: bool = False) -> dict:
     """Convert flow sample (B, P, 15) back into valid SQ dict matching SQDecoder's output keys."""
     if normalized:
         shift, scale = _shift_scale(x)
         x = x * scale + shift
+    # In flow space, GT existence is 0 or 1 (threshold 0.5). For differentiable BCE in mix loss,
+    # map (exist - 0.5) * 8.0 to an unbounded logit centered at 0.5 so gradients never vanish.
+    exist_logit = (x[..., 14] - 0.5) * 8.0 if smooth_exist else torch.logit(x[..., 14].clamp(1e-4, 1.0 - 1e-4))
     return {
         "t": x[..., 0:3],
         "R": rot6d_to_matrix(x[..., 3:9]),
         "scale": torch.exp(x[..., 9:12].clamp(-10.0, 4.0)).clamp_min(SCALE_MIN),
         "eps": EPS_MIN + (EPS_MAX - EPS_MIN) * torch.sigmoid(x[..., 12:14]),
-        "exist_logit": torch.logit(x[..., 14].clamp(1e-4, 1.0 - 1e-4)),  # >0 iff exist > 0.5
+        "exist_logit": exist_logit,
     }
 
 
@@ -146,10 +150,13 @@ class FlowSQDenoiser(nn.Module):
 
 
 def flow_loss(denoiser: FlowSQDenoiser, tokens: torch.Tensor, tgt: dict,
-              generator: torch.Generator | None = None, repeat: int = 1) -> tuple[torch.Tensor, dict]:
-    """CondOT velocity MSE: active slots for SQ params, all P slots for existence."""
+              generator: torch.Generator | None = None, repeat: int = 1,
+              mode: str = "velocity", w_x1: float = 1.0) -> tuple[torch.Tensor, dict]:
+    """CondOT velocity MSE, optionally mixed with t-weighted decoded x1_hat parameter MSE + BCE."""
     if repeat < 1:
         raise ValueError(f"repeat must be >= 1, got {repeat}")
+    if mode not in ("velocity", "mix"):
+        raise ValueError(f"unknown flow loss mode {mode!r}")
     mem, n_views = denoiser.encode_tokens(tokens)
     x_1 = pack_sq(tgt)
     m = tgt["exist"]
@@ -165,8 +172,27 @@ def flow_loss(denoiser: FlowSQDenoiser, tokens: torch.Tensor, tgt: dict,
     n = m.sum().clamp_min(1.0)
     parts = {k: (err2[..., sl].mean(-1) * m).sum() / n for k, sl in GROUP_SLICES.items() if k != "exist"}
     parts["exist"] = err2[..., 14].mean()
-    total = sum(parts.values())
-    return total, {k: v.item() for k, v in parts.items()}
+    v_loss = sum(parts.values())
+    if mode == "velocity":
+        return v_loss, {k: v.item() for k, v in parts.items()}
+
+    # Weight x1 parameter loss by t so noisy samples near t=0 (where x1_hat is unreliable) do not dominate.
+    x1_hat = x_t + (1.0 - t[:, None, None]) * v_pred
+    pred_sq = decode_sq(x1_hat, normalized=True, smooth_exist=True)
+    wt = t[:, None]
+    rep = (lambda a: a.repeat_interleave(repeat, dim=0)) if repeat > 1 else (lambda a: a)
+    x1_masked = lambda a, b: ((((a - b) ** 2).flatten(2).mean(-1) * wt) * m).sum() / n
+    x1_loss = (
+        x1_masked(pred_sq["t"], rep(tgt["t"]))
+        + x1_masked(pred_sq["R"], rep(tgt["R"]))
+        + x1_masked(pred_sq["scale"].log(), rep(tgt["scale"]).log())
+        + x1_masked(pred_sq["eps"], rep(tgt["eps"]))
+        + (F.binary_cross_entropy_with_logits(pred_sq["exist_logit"], m, reduction="none") * wt).mean()
+    )
+    total = v_loss + w_x1 * x1_loss
+    out = {k: v.item() for k, v in parts.items()}
+    out.update(v_loss=v_loss.item(), x1_loss=x1_loss.item())
+    return total, out
 
 
 # Adapted from nova3r (Apache-2.0): BatchModelWrapper + Euler ODESolver loop (model_wrapper.py, ode_solver.py).

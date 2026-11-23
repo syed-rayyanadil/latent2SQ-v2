@@ -259,6 +259,9 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--decoder", choices=["parallel", "flow"], default="parallel", help="parallel SQDecoder or flow-matching denoiser")
     p.add_argument("--flow-steps", type=int, default=20, help="Euler ODE steps when --decoder flow")
     p.add_argument("--flow-repeat", type=int, default=1, help="independent (t, x_0) draws per step reusing VGGT tokens")
+    p.add_argument("--flow-loss", choices=["velocity", "mix"], default="velocity",
+                   help="velocity: CondOT velocity MSE; mix: + --w-x1 * t-weighted decoded x1 loss")
+    p.add_argument("--w-x1", type=float, default=1.0, help="weight of x1 loss when --flow-loss mix")
     # optimization
     p.add_argument("--steps", type=int, default=3000)
     p.add_argument("--batch", type=int, default=2, help="samples per step (each N views)")
@@ -426,7 +429,7 @@ def main(argv: list[str] | None = None) -> None:
         td0 = time.perf_counter()
         t_vggt += td0 - tv0
         if a.decoder == "flow":
-            loss, parts = flow_loss(dec, tokens, tgt, repeat=a.flow_repeat)
+            loss, parts = flow_loss(dec, tokens, tgt, repeat=a.flow_repeat, mode=a.flow_loss, w_x1=a.w_x1)
         else:
             pred = dec(tokens)
             if a.deform and step <= a.deform_start:      # rigid phase: deformation outputs get no gradient

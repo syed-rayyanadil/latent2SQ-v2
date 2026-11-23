@@ -223,8 +223,48 @@ def test_flow_repeat() -> None:
     assert sum(hist[-10:]) / 10 < sum(hist[:10]) / 10 * 0.25
 
 
+def test_flow_loss_mix() -> None:
+    torch.manual_seed(0)
+    B, P, M = 2, 16, 7
+    tgt = _fake_tgt(B, P, M)
+    tokens = torch.randn(B, 2, 8, TOKEN_DIM)
+    denoiser = FlowSQDenoiser(d_model=64, n_queries=P, n_layers=2, n_heads=4, ffn_dim=128)
+
+    # 1. Default mode="velocity" matches explicit velocity loss bit-for-bit
+    l_def, p_def = flow_loss(denoiser, tokens, tgt, generator=torch.Generator().manual_seed(77))
+    l_vel, p_vel = flow_loss(denoiser, tokens, tgt, generator=torch.Generator().manual_seed(77), mode="velocity")
+    assert torch.allclose(l_def, l_vel, atol=1e-7) and p_def == p_vel
+
+    # 2. mode="mix" is finite, logs v_loss & x1_loss separately, and backprops finite gradients
+    denoiser.zero_grad()
+    l_mix, p_mix = flow_loss(denoiser, tokens, tgt, generator=torch.Generator().manual_seed(77),
+                             repeat=2, mode="mix", w_x1=1.0)
+    assert torch.isfinite(l_mix) and "v_loss" in p_mix and "x1_loss" in p_mix
+    assert np.isfinite(p_mix["v_loss"]) and np.isfinite(p_mix["x1_loss"])
+    l_mix.backward()
+    grads = [p.grad for p in denoiser.parameters() if p.requires_grad]
+    assert all(g is not None and torch.isfinite(g).all() for g in grads)
+    assert any(g.abs().sum() > 0 for g in grads)
+
+    # 3. Short single-batch overfit with mode="mix" converges
+    print("\n=== Single-batch overfit with --flow-loss mix (200 steps) ===")
+    opt = torch.optim.AdamW(denoiser.parameters(), lr=2e-3)
+    hist = []
+    for step in range(1, 201):
+        loss, parts = flow_loss(denoiser, tokens, tgt, repeat=2, mode="mix", w_x1=1.0)
+        opt.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(denoiser.parameters(), 1.0)
+        opt.step()
+        hist.append((loss.item(), parts["v_loss"], parts["x1_loss"]))
+        if step == 1 or step % 50 == 0:
+            print(f"  step {step:3d}: total={loss.item():.4f}  v_loss={parts['v_loss']:.4f}  x1_loss={parts['x1_loss']:.4f}")
+    assert sum(x[0] for x in hist[-10:]) / 10 < sum(x[0] for x in hist[:10]) / 10 * 0.25
+
+
 if __name__ == "__main__":
     test_overfit_one_batch()
     test_flow_repeat()
+    test_flow_loss_mix()
     test_train_py_flow_wiring()
     print("\nALL CPU FLOW TESTS PASSED")
