@@ -65,9 +65,10 @@ def _euler_from_t(dec: FlowSQDenoiser, tokens: torch.Tensor, x: torch.Tensor, t0
     return x
 
 
-def _unnorm(x: torch.Tensor, t_mean: torch.Tensor | None = None, t_std: torch.Tensor | None = None) -> torch.Tensor:
-    shift, scale = _shift_scale(x)
-    out = x * scale + shift
+def _unnorm(x: torch.Tensor, t_mean: torch.Tensor | None = None, t_std: torch.Tensor | None = None,
+            shift: torch.Tensor | None = None, scale: torch.Tensor | None = None) -> torch.Tensor:
+    sh, sc = _shift_scale(x, shift, scale)
+    out = x * sc + sh
     if t_mean is not None and t_std is not None:
         t_real = out[..., 0:3] * t_std.to(out).clamp_min(1e-6) + t_mean.to(out)
         out = torch.cat([t_real, out[..., 3:]], dim=-1)
@@ -120,7 +121,7 @@ def main(argv: list[str] | None = None) -> None:
             rows = []
             for tgt, tokens in cached[n]:
                 x_smp = sample_euler(dec, tokens, n_queries=P, n_steps=n_steps, generator=gen)
-                pred = decode_sq(x_smp, t_mean=dec.t_mean, t_std=dec.t_std)
+                pred = decode_sq(x_smp, t_mean=dec.t_mean, t_std=dec.t_std, shift=dec.flow_shift, scale=dec.flow_scale)
                 rows.append(_metrics(pred, tgt))
                 if n_steps == 20:
                     samples_20.setdefault(n, []).append((tgt, x_smp, pred))
@@ -135,17 +136,19 @@ def main(argv: list[str] | None = None) -> None:
         tf_rows, one_rows = [], []
         for n in (4, 8):
             for tgt, tokens in cached[n]:
-                x_1 = pack_sq(tgt, t_mean=dec.t_mean, t_std=dec.t_std)
+                x_1 = pack_sq(tgt, t_mean=dec.t_mean, t_std=dec.t_std, shift=dec.flow_shift, scale=dec.flow_scale)
                 x_0 = torch.randn(x_1.shape, device=x_1.device, dtype=x_1.dtype, generator=gen)
                 x_t = t0 * x_1 + (1.0 - t0) * x_0
 
                 x_tf = _euler_from_t(dec, tokens, x_t, t0, total_steps=20)
-                tf_rows.append(_metrics(decode_sq(x_tf, t_mean=dec.t_mean, t_std=dec.t_std), tgt))
+                tf_rows.append(_metrics(decode_sq(x_tf, t_mean=dec.t_mean, t_std=dec.t_std,
+                                                  shift=dec.flow_shift, scale=dec.flow_scale), tgt))
 
                 t_vec = torch.full((x_t.shape[0],), t0, device=x_t.device, dtype=x_t.dtype)
                 v_hat = dec(x_t, t_vec, tokens=tokens)
                 x1_hat = x_t + (1.0 - t0) * v_hat
-                one_rows.append(_metrics(decode_sq(x1_hat, t_mean=dec.t_mean, t_std=dec.t_std), tgt))
+                one_rows.append(_metrics(decode_sq(x1_hat, t_mean=dec.t_mean, t_std=dec.t_std,
+                                                   shift=dec.flow_shift, scale=dec.flow_scale), tgt))
         print(f"   t0={t0:.2f} [teacher-forced ODE]: {_fmt(_summarize(tf_rows))}")
         print(f"   t0={t0:.2f} [1-step x1_hat    ]: {_fmt(_summarize(one_rows))}")
 
@@ -161,13 +164,13 @@ def main(argv: list[str] | None = None) -> None:
                 other = cached[n][(idx + 1) % len(cached[n])][1]
                 tok_shuf = other[:1]
             x_shuf = sample_euler(dec, tok_shuf, n_queries=P, n_steps=20, generator=gen)
-            pred_shuf = decode_sq(x_shuf, t_mean=dec.t_mean, t_std=dec.t_std)
+            pred_shuf = decode_sq(x_shuf, t_mean=dec.t_mean, t_std=dec.t_std, shift=dec.flow_shift, scale=dec.flow_scale)
             _, x_corr, pred_corr = samples_20[n][idx]
 
             s = tgt["s"][:, None]
             dt_world.append(float(((pred_corr["t"] - pred_shuf["t"]).norm(dim=-1) * s).mean()))
-            dt_flow.append(float((_unnorm(x_corr, dec.t_mean, dec.t_std)[..., :3] -
-                                  _unnorm(x_shuf, dec.t_mean, dec.t_std)[..., :3]).abs().mean()))
+            dt_flow.append(float((_unnorm(x_corr, dec.t_mean, dec.t_std, dec.flow_shift, dec.flow_scale)[..., :3] -
+                                  _unnorm(x_shuf, dec.t_mean, dec.t_std, dec.flow_shift, dec.flow_scale)[..., :3]).abs().mean()))
             p_corr = torch.sigmoid(pred_corr["exist_logit"])
             p_shuf = torch.sigmoid(pred_shuf["exist_logit"])
             dexist.append(float((p_corr - p_shuf).abs().mean()))
@@ -182,7 +185,8 @@ def main(argv: list[str] | None = None) -> None:
     print("\n5. Raw flow-space ranges (min, max) — GT vs Sampled (20 steps):")
     gt_raw = torch.cat([pack_sq(tgt, normalize=False) for n in (4, 8) for tgt, _ in cached[n]], dim=0)
     gt_mask = torch.cat([tgt["exist"] > 0.5 for n in (4, 8) for tgt, _ in cached[n]], dim=0)
-    smp_raw = torch.cat([_unnorm(x_smp, dec.t_mean, dec.t_std) for n in (4, 8) for _, x_smp, _ in samples_20[n]], dim=0)
+    smp_raw = torch.cat([_unnorm(x_smp, dec.t_mean, dec.t_std, dec.flow_shift, dec.flow_scale)
+                         for n in (4, 8) for _, x_smp, _ in samples_20[n]], dim=0)
     smp_mask = smp_raw[..., 14] > 0.5
     for name in ("t", "scale", "eps", "exist"):
         sl = GROUP_SLICES[name]

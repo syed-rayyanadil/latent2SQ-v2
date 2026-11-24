@@ -154,6 +154,19 @@ def test_train_py_flow_wiring() -> None:
         ckpt_tn = torch.load(out_tn / "decoder.pt", map_location="cpu", weights_only=False)
         assert not torch.allclose(ckpt_tn["decoder"]["t_mean"], torch.zeros(3))
 
+        out_all = Path(tmp) / "run_norm_all"
+        train_mod.main([
+            "--train", "fake_train", "--test", "fake_test", "--gt-sq", "fake.npz",
+            "--out", str(out_all), "--decoder", "flow", "--flow-norm-all", "--layers", "1", "--d-model", "64",
+            "--heads", "4", "--ffn", "128", "--steps", "1", "--log-every", "1",
+            "--eval-every", "1", "--eval-per-n", "1", "--examples", "1", "--batch", "2",
+            "--n-surf", "64", "--n-vol", "64", "--flow-steps", "4", "--device", "cpu", "--no-tb",
+        ])
+        ckpt_all = torch.load(out_all / "decoder.pt", map_location="cpu", weights_only=False)
+        assert torch.allclose(ckpt_all["decoder"]["t_mean"], torch.zeros(3))
+        assert ckpt_all["decoder"]["flow_shift"][14].item() == 0.5 and ckpt_all["decoder"]["flow_scale"][14].item() == 0.5
+        assert (ckpt_all["decoder"]["flow_scale"][:14] >= 0.05).all()
+
         # Verify evaluate() counts empty predictions and uses nanmean safely
         class EmptyDec(torch.nn.Module):
             deform = False
@@ -319,10 +332,66 @@ def test_flow_t_norm() -> None:
     assert torch.allclose(reloaded.t_mean, t_mean) and torch.allclose(reloaded.t_std, t_std)
 
 
+def test_flow_norm_all() -> None:
+    torch.manual_seed(0)
+    B, P, M = 2, 16, 7
+    tgt = _fake_tgt(B, P, M)
+    tokens = torch.randn(B, 2, 8, TOKEN_DIM)
+    raw = pack_sq(tgt, normalize=False)[tgt["exist"] > 0.5]
+    sh = torch.cat([raw.mean(0)[:14], torch.tensor([0.5])])
+    sc = torch.cat([raw.std(0, unbiased=False).clamp_min(0.05)[:14], torch.tensor([0.5])])
+
+    # 1. Default off and --flow-t-norm alone keep exact behavior
+    d_def = FlowSQDenoiser(d_model=64, n_queries=P, n_layers=2, n_heads=4, ffn_dim=128)
+    l_def, _ = flow_loss(d_def, tokens, tgt, generator=torch.Generator().manual_seed(55))
+    assert torch.allclose(pack_sq(tgt), pack_sq(tgt, t_mean=d_def.t_mean, t_std=d_def.t_std,
+                                                shift=d_def.flow_shift, scale=d_def.flow_scale))
+    t_mean, t_std = torch.tensor([0.1, -0.2, 0.9]), torch.tensor([0.3, 0.4, 0.5])
+    d_tn = FlowSQDenoiser(d_model=64, n_queries=P, n_layers=2, n_heads=4, ffn_dim=128)
+    d_tn.set_t_norm(t_mean, t_std)
+    assert torch.equal(pack_sq(tgt, t_mean=t_mean, t_std=t_std),
+                       pack_sq(tgt, t_mean=d_tn.t_mean, t_std=d_tn.t_std,
+                               shift=d_tn.flow_shift, scale=d_tn.flow_scale))
+
+    # 2. Round trip with --flow-norm-all on
+    x_norm = pack_sq(tgt, shift=sh, scale=sc)
+    assert torch.allclose(x_norm[..., :14], (pack_sq(tgt, normalize=False)[..., :14] - sh[:14]) / sc[:14], atol=1e-6)
+    assert torch.allclose(x_norm[..., 14], (tgt["exist"] - 0.5) / 0.5, atol=1e-6)
+    rt = decode_sq(x_norm, shift=sh, scale=sc)
+    _assert_valid_sq(rt, B, P)
+    assert torch.allclose(rt["t"][:, :M], tgt["t"][:, :M], atol=1e-5)
+    assert torch.allclose(rt["R"][:, :M], tgt["R"][:, :M], atol=1e-5)
+    assert torch.allclose(rt["scale"][:, :M], tgt["scale"][:, :M], atol=1e-4)
+    assert torch.allclose(rt["eps"][:, :M], tgt["eps"][:, :M], atol=1e-4)
+
+    # 3. Single-batch overfit with --flow-norm-all (mix loss -> real-space x1 comparison) + buffer reload
+    denoiser = FlowSQDenoiser(d_model=64, n_queries=P, n_layers=2, n_heads=4, ffn_dim=128)
+    denoiser.set_flow_norm(sh, sc)
+    print("\n=== Single-batch overfit with --flow-norm-all (200 steps) ===")
+    opt = torch.optim.AdamW(denoiser.parameters(), lr=2e-3)
+    hist = []
+    for step in range(1, 201):
+        loss, parts = flow_loss(denoiser, tokens, tgt, repeat=2, mode="mix", w_x1=1.0)
+        opt.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(denoiser.parameters(), 1.0)
+        opt.step()
+        hist.append(loss.item())
+        if step == 1 or step % 50 == 0:
+            print(f"  step {step:3d}: total={loss.item():.4f}  v_loss={parts['v_loss']:.4f}  x1_loss={parts['x1_loss']:.4f}")
+    assert sum(hist[-10:]) / 10 < sum(hist[:10]) / 10 * 0.25
+
+    reloaded = FlowSQDenoiser(d_model=64, n_queries=P, n_layers=2, n_heads=4, ffn_dim=128)
+    reloaded.load_state_dict(denoiser.state_dict())
+    assert torch.allclose(reloaded.flow_shift, sh) and torch.allclose(reloaded.flow_scale, sc)
+    assert torch.isfinite(l_def)
+
+
 if __name__ == "__main__":
     test_overfit_one_batch()
     test_flow_repeat()
     test_flow_loss_mix()
     test_flow_t_norm()
+    test_flow_norm_all()
     test_train_py_flow_wiring()
     print("\nALL CPU FLOW TESTS PASSED")
