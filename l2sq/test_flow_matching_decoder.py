@@ -399,6 +399,58 @@ def test_slot_init_sinus() -> None:
     assert out.shape == (B, 16, 15) and torch.isfinite(out).all()
 
 
+def test_fourier_and_l2_vel_loss() -> None:
+    from l2sq.eval_occlusion import load_decoder
+
+    torch.manual_seed(0)
+    B, P, M = 2, 16, 7
+    tgt = _fake_tgt(B, P, M, seed=11)
+    tokens = torch.randn(B, 2, 8, TOKEN_DIM)
+
+    # 1. Fourier input embedding (fourier_freqs=4 -> in_features = 15 * (1 + 2 * 4) = 135)
+    den_f = FlowSQDenoiser(d_model=64, n_queries=P, n_layers=1, n_heads=4, ffn_dim=128,
+                           slot_init="sinus", fourier_freqs=4)
+    assert den_f.x_proj.in_features == 15 * (1 + 2 * 4)
+    x_t = torch.randn(B, P, 15)
+    v_out = den_f(x_t, torch.rand(B), tokens=tokens)
+    assert v_out.shape == (B, P, 15) and torch.isfinite(v_out).all()
+
+    # Checkpoint reload with new options AND legacy checkpoint without new keys
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        new_ckpt = tmp_dir / "new.pt"
+        old_ckpt = tmp_dir / "old.pt"
+        base_args = {"d_model": 64, "queries": P, "layers": 1, "heads": 4, "ffn": 128, "decoder": "flow"}
+        torch.save({"decoder": den_f.state_dict(),
+                    "args": {**base_args, "flow_slot_sinus": True, "flow_fourier": 4, "flow_vel_loss": "l2"}},
+                   new_ckpt)
+        den_old = FlowSQDenoiser(d_model=64, n_queries=P, n_layers=1, n_heads=4, ffn_dim=128)
+        torch.save({"decoder": den_old.state_dict(), "args": base_args}, old_ckpt)
+
+        kind_n, rel_new, _, _ = load_decoder(new_ckpt, "cpu")
+        kind_o, rel_old, _, _ = load_decoder(old_ckpt, "cpu")
+        assert kind_n == "flow" and rel_new.fourier_freqs == 4 and rel_new.x_proj.in_features == 135
+        assert torch.equal(rel_new.slot_emb, den_f.slot_emb)
+        assert kind_o == "flow" and rel_old.fourier_freqs == 0 and rel_old.x_proj.in_features == 15
+
+    # 2. Euclidean velocity loss (vel_loss="l2"): finite, finite grads, != mse, exact group structure
+    loss_mse, parts_mse = flow_loss(den_f, tokens, tgt, generator=torch.Generator().manual_seed(99), vel_loss="mse")
+    loss_l2, parts_l2 = flow_loss(den_f, tokens, tgt, generator=torch.Generator().manual_seed(99), vel_loss="l2")
+    assert set(parts_l2.keys()) == set(parts_mse.keys()) == {"t", "R", "scale", "eps", "exist"}
+    assert torch.isfinite(loss_l2) and loss_l2.item() != loss_mse.item()
+    loss_l2.backward()
+    grads = [p.grad for p in den_f.parameters() if p.grad is not None]
+    assert len(grads) > 0 and all(torch.isfinite(g).all() for g in grads)
+
+    # Also verify mix mode works with vel_loss="l2"
+    den_f.zero_grad()
+    loss_mix_l2, parts_mix = flow_loss(den_f, tokens, tgt, generator=torch.Generator().manual_seed(99),
+                                       mode="mix", w_x1=1.0, vel_loss="l2")
+    assert torch.isfinite(loss_mix_l2) and "x1_loss" in parts_mix
+    loss_mix_l2.backward()
+    assert all(torch.isfinite(p.grad).all() for p in den_f.parameters() if p.grad is not None)
+
+
 if __name__ == "__main__":
     test_overfit_one_batch()
     test_flow_repeat()
@@ -406,5 +458,6 @@ if __name__ == "__main__":
     test_flow_t_norm()
     test_flow_norm_all()
     test_slot_init_sinus()
+    test_fourier_and_l2_vel_loss()
     test_train_py_flow_wiring()
     print("\nALL CPU FLOW TESTS PASSED")

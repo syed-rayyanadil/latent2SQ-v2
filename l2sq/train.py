@@ -164,7 +164,7 @@ def evaluate(vggt, dec, pool, samples_by_n, P, batch, device, cfg: dict, geom: G
             if cfg.get("decoder", "parallel") == "flow":
                 pred = decode_sq(sample_euler(dec, tokens, n_queries=P, n_steps=cfg.get("flow_steps", 20), generator=gen),
                                  t_mean=dec.t_mean, t_std=dec.t_std, shift=dec.flow_shift, scale=dec.flow_scale)
-                loss, _ = flow_loss(dec, tokens, tgt, generator=gen)
+                loss, _ = flow_loss(dec, tokens, tgt, generator=gen, vel_loss=cfg.get("flow_vel_loss", "mse"))
             else:
                 pred = dec(tokens)
                 loss, _ = compute_loss(pred, tgt, cfg)
@@ -269,6 +269,10 @@ def main(argv: list[str] | None = None) -> None:
                    help="per-dim (x - mean) / std over all SQ groups (t, rot6d, log-scale, eps logit) in flow space")
     p.add_argument("--flow-slot-sinus", action="store_true",
                    help="initialize FlowSQDenoiser.slot_emb with sinusoidal embeddings instead of N(0, 0.02^2)")
+    p.add_argument("--flow-fourier", type=int, default=0,
+                   help="Fourier frequency bands for x_t input embedding in FlowSQDenoiser (0 = off)")
+    p.add_argument("--flow-vel-loss", choices=["mse", "l2"], default="mse",
+                   help="flow velocity loss per SQ parameter group: mse or Euclidean norm (l2)")
     # optimization
     p.add_argument("--steps", type=int, default=3000)
     p.add_argument("--batch", type=int, default=2, help="samples per step (each N views)")
@@ -346,7 +350,7 @@ def main(argv: list[str] | None = None) -> None:
     a.exist_mode = loss_config(vars(a))["exist_mode"]     # store the resolved default with the run
     (out / "args.json").write_text(json.dumps(vars(a), indent=2))
     cfg = {**loss_config(vars(a)), "n_surf": a.n_surf, "n_vol": a.n_vol,
-           "decoder": a.decoder, "flow_steps": a.flow_steps}
+           "decoder": a.decoder, "flow_steps": a.flow_steps, "flow_vel_loss": a.flow_vel_loss}
     if a.decoder == "flow" and a.deform:
         sys.exit("--decoder flow supports rigid 15-dim SQs only (omit --deform).")
 
@@ -368,7 +372,8 @@ def main(argv: list[str] | None = None) -> None:
         s0 = collate(train_pool, [make_sample(train_pool, gt, [0])], a.queries, "cpu")
         print(f"flow x_1 raw min/max: {flow_group_stats(pack_sq(s0, normalize=False), s0['exist'])}", file=sys.stderr)
         dec = FlowSQDenoiser(a.d_model, a.queries, a.layers, a.heads, a.ffn,
-                             slot_init="sinus" if a.flow_slot_sinus else "small").to(device)
+                             slot_init="sinus" if a.flow_slot_sinus else "small",
+                             fourier_freqs=a.flow_fourier).to(device)
         if a.flow_norm_all:
             stat_rng = np.random.default_rng(a.seed + 999)
             raw_vals = []
@@ -467,7 +472,8 @@ def main(argv: list[str] | None = None) -> None:
         td0 = time.perf_counter()
         t_vggt += td0 - tv0
         if a.decoder == "flow":
-            loss, parts = flow_loss(dec, tokens, tgt, repeat=a.flow_repeat, mode=a.flow_loss, w_x1=a.w_x1)
+            loss, parts = flow_loss(dec, tokens, tgt, repeat=a.flow_repeat, mode=a.flow_loss,
+                                    w_x1=a.w_x1, vel_loss=a.flow_vel_loss)
         else:
             pred = dec(tokens)
             if a.deform and step <= a.deform_start:      # rigid phase: deformation outputs get no gradient

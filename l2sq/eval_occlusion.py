@@ -45,6 +45,8 @@ def load_decoder(ckpt_path: str | Path, device: str) -> tuple[str, torch.nn.Modu
     elif kind == "flow":
         dec = FlowSQDenoiser(
             args["d_model"], args["queries"], args["layers"], args["heads"], args["ffn"],
+            slot_init="sinus" if args.get("flow_slot_sinus", False) else "small",
+            fourier_freqs=args.get("flow_fourier", 0),
         )
         dec.load_state_dict(ckpt["decoder"])
         if "t_mean" not in ckpt["decoder"] and "t_mean" in args and "t_std" in args:

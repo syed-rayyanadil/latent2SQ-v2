@@ -94,7 +94,11 @@ def main(argv: list[str] | None = None) -> None:
     batch_size = a.batch or args.get("batch", 2)
     per_n = args.get("eval_per_n", 8)
 
-    dec = FlowSQDenoiser(args["d_model"], P, args["layers"], args["heads"], args["ffn"]).to(a.device).eval()
+    dec = FlowSQDenoiser(
+        args["d_model"], P, args["layers"], args["heads"], args["ffn"],
+        slot_init="sinus" if args.get("flow_slot_sinus", False) else "small",
+        fourier_freqs=args.get("flow_fourier", 0),
+    ).to(a.device).eval()
     dec.load_state_dict(ckpt["decoder"])
     vggt = FrozenVGGT(args["vggt_layer"]).to(a.device)
 

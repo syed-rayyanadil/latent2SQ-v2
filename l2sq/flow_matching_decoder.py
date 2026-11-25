@@ -128,13 +128,17 @@ class FlowSQDenoiser(nn.Module):
 
     def __init__(self, d_model: int = 256, n_queries: int = 16, n_layers: int = 4, n_heads: int = 8,
                  ffn_dim: int = 1024, dropout: float = 0.0, ref_embedding: bool = True,
-                 slot_init: str = "small"):
+                 slot_init: str = "small", fourier_freqs: int = 0):
         super().__init__()
+        if fourier_freqs < 0:
+            raise ValueError(f"fourier_freqs must be >= 0, got {fourier_freqs}")
         self.deform = False
+        self.fourier_freqs = fourier_freqs
         self.in_norm = nn.LayerNorm(TOKEN_DIM)
         self.in_proj = nn.Linear(TOKEN_DIM, d_model)
         self.ref_embedding = nn.Parameter(torch.zeros(d_model)) if ref_embedding else None
-        self.x_proj = nn.Linear(SQ_DIM, d_model)
+        in_dim = SQ_DIM * (1 + 2 * fourier_freqs)
+        self.x_proj = nn.Linear(in_dim, d_model)
         if slot_init == "small":
             self.slot_emb = nn.Parameter(torch.randn(1, n_queries, d_model) * 0.02)
         elif slot_init == "sinus":
@@ -184,7 +188,16 @@ class FlowSQDenoiser(nn.Module):
         cond = self.t_embedder(t)
         if n_views is not None:
             cond = cond + self.view_embedder(torch.full_like(t, float(n_views) / 8.0))
-        x = self.x_proj(x_t) + self.slot_emb[:, :x_t.shape[1]]
+        if self.fourier_freqs > 0:
+            feats = [x_t]
+            for k in range(self.fourier_freqs):
+                ang = x_t * (math.pi * (2.0 ** k))
+                feats.append(torch.sin(ang))
+                feats.append(torch.cos(ang))
+            x_in = torch.cat(feats, dim=-1)
+        else:
+            x_in = x_t
+        x = self.x_proj(x_in) + self.slot_emb[:, :x_t.shape[1]]
         for blk in self.blocks:
             x = blk(x, mem, cond)
         return self.out_proj(self.out_norm(x)) + self.t_scale(cond).unsqueeze(1) * self.x_skip(x_t)
@@ -192,12 +205,15 @@ class FlowSQDenoiser(nn.Module):
 
 def flow_loss(denoiser: FlowSQDenoiser, tokens: torch.Tensor, tgt: dict,
               generator: torch.Generator | None = None, repeat: int = 1,
-              mode: str = "velocity", w_x1: float = 1.0) -> tuple[torch.Tensor, dict]:
-    """CondOT velocity MSE, optionally mixed with t-weighted decoded x1_hat parameter MSE + BCE."""
+              mode: str = "velocity", w_x1: float = 1.0,
+              vel_loss: str = "mse") -> tuple[torch.Tensor, dict]:
+    """CondOT velocity loss ('mse' or Euclidean 'l2'), optionally mixed with t-weighted decoded x1_hat MSE + BCE."""
     if repeat < 1:
         raise ValueError(f"repeat must be >= 1, got {repeat}")
     if mode not in ("velocity", "mix"):
         raise ValueError(f"unknown flow loss mode {mode!r}")
+    if vel_loss not in ("mse", "l2"):
+        raise ValueError(f"unknown vel_loss {vel_loss!r}")
     mem, n_views = denoiser.encode_tokens(tokens)
     x_1 = pack_sq(tgt, t_mean=denoiser.t_mean, t_std=denoiser.t_std,
                   shift=denoiser.flow_shift, scale=denoiser.flow_scale)
@@ -212,8 +228,13 @@ def flow_loss(denoiser: FlowSQDenoiser, tokens: torch.Tensor, tgt: dict,
     v_pred = denoiser(x_t, t, mem=mem, n_views=n_views)
     err2 = (v_pred - (x_1 - x_0)) ** 2
     n = m.sum().clamp_min(1.0)
-    parts = {k: (err2[..., sl].mean(-1) * m).sum() / n for k, sl in GROUP_SLICES.items() if k != "exist"}
-    parts["exist"] = err2[..., 14].mean()
+    if vel_loss == "l2":
+        parts = {k: (torch.sqrt(err2[..., sl].sum(dim=-1) + 1e-8) * m).sum() / n
+                 for k, sl in GROUP_SLICES.items() if k != "exist"}
+        parts["exist"] = torch.sqrt(err2[..., 14:15].sum(dim=-1) + 1e-8).mean()
+    else:
+        parts = {k: (err2[..., sl].mean(-1) * m).sum() / n for k, sl in GROUP_SLICES.items() if k != "exist"}
+        parts["exist"] = err2[..., 14].mean()
     v_loss = sum(parts.values())
     if mode == "velocity":
         return v_loss, {k: v.item() for k, v in parts.items()}
