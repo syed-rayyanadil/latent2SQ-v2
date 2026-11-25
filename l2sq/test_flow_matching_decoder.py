@@ -611,6 +611,34 @@ def test_flow_geo_loss() -> None:
             assert len(grads) > 0 and all(torch.isfinite(gr).all() for gr in grads)
 
 
+    # 4. Geo chamfer robustness against zero-scale, NaN-prone, and empty-active-slot x1_hat
+    x_bad = torch.zeros(B, P, 15)
+    x_bad[:, 0, 9:12] = -1e6                               # tiny/zero scale after exp clamp
+    x_bad[:, 1, 9:12] = float("nan")                       # NaN-prone scale
+    x_bad[:, 1, 12:14] = float("inf")                      # NaN-prone eps
+    x_bad[:, 1, 3:9] = 0.0                                 # zero rot6d -> zero cross area
+    x_bad.requires_grad_(True)
+    pred_bad = decode_sq(x_bad, normalized=False, smooth_exist=True)
+    # Also directly set scale=0 on slot 0 to verify zero-scale tolerance without decode clamp
+    pred_bad_direct = {**pred_bad, "scale": pred_bad["scale"].clone()}
+    pred_bad_direct["scale"][:, 0] = 0.0
+    g_bad = _geo_surface_loss(pred_bad_direct, tgt, wt, m, n, rep, False, "chamfer", 1)
+    assert torch.isfinite(g_bad)
+    g_bad.backward()
+    assert x_bad.grad is not None and torch.isfinite(x_bad.grad).all()
+    # Finite active slot (slot 2) still receives non-zero gradient through chamfer
+    assert x_bad.grad[:, 2, 0:3].abs().sum() > 0
+
+    # Sample with zero active teacher slots skips cleanly (0 loss, finite)
+    m_partial = torch.zeros(B, P)
+    m_partial[0, :M] = 1.0
+    g_part = _geo_surface_loss(tgt, tgt, wt, m_partial, m_partial.sum().clamp_min(1.0), rep, False, "chamfer", 1)
+    assert torch.isfinite(g_part)
+    m_none = torch.zeros(B, P)
+    g_empty = _geo_surface_loss(tgt, tgt, wt, m_none, m_none.sum().clamp_min(1.0), rep, False, "chamfer", 1)
+    assert g_empty.item() == 0.0
+
+
 if __name__ == "__main__":
     test_overfit_one_batch()
     test_flow_repeat()

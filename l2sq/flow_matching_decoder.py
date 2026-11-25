@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from l2sq.model import TOKEN_DIM, sinusoidal
-from l2sq.sq import EPS_MAX, EPS_MIN, SCALE_MIN, chamfer, rot6d_to_matrix, sample_surface, sample_surface_uniform
+from l2sq.sq import EPS_MAX, EPS_MIN, SCALE_MIN, chamfer, grid_faces, rot6d_to_matrix, sample_surface
 
 SQ_DIM = 15  # rigid: t(3), rot6d(6), log_scale(3), eps_raw(2), exist(1)
 DEFORM_DIM = 26  # + taper(2), bend_logit(3), alpha_cs(6)
@@ -245,6 +245,50 @@ class FlowSQDenoiser(nn.Module):
         return self.out_proj(self.out_norm(x)) + self.t_scale(cond).unsqueeze(1) * self.x_skip(x_t)
 
 
+def _sanitize_sq_for_sampling(sq: dict, deform: bool) -> dict:
+    """Clamp/clean SQ tensors to finite sane ranges for surface sampling while preserving finite gradients."""
+    scale = torch.where(torch.isfinite(sq["scale"]), sq["scale"], torch.full_like(sq["scale"], SCALE_MIN))
+    scale = scale.clamp(min=1e-4, max=50.0)
+    eps = torch.where(torch.isfinite(sq["eps"]), sq["eps"], torch.ones_like(sq["eps"])).clamp(min=EPS_MIN, max=EPS_MAX)
+    t = torch.where(torch.isfinite(sq["t"]), sq["t"], torch.zeros_like(sq["t"])).clamp(min=-50.0, max=50.0)
+    eye = torch.eye(3, device=sq["R"].device, dtype=sq["R"].dtype).expand_as(sq["R"])
+    r_ok = torch.isfinite(sq["R"]).all(dim=-1, keepdim=True).all(dim=-2, keepdim=True)
+    R = torch.where(r_ok, sq["R"], eye)
+    out = {"scale": scale, "eps": eps, "R": R, "t": t}
+    if deform:
+        taper = torch.where(torch.isfinite(sq["taper"]), sq["taper"], torch.zeros_like(sq["taper"])).clamp(-0.99, 0.99)
+        bend = torch.where(torch.isfinite(sq["bend"]), sq["bend"], torch.full_like(sq["bend"], 1e-4)).clamp(1e-4, 1.0 - 1e-4)
+        alpha = torch.where(torch.isfinite(sq["alpha"]), sq["alpha"], torch.zeros_like(sq["alpha"]))
+        out.update(taper=taper, bend=bend, alpha=alpha)
+    return out
+
+
+def _safe_sample_surface_uniform(
+    scale: torch.Tensor, eps: torch.Tensor, R: torch.Tensor, t: torch.Tensor, n: int,
+    taper: torch.Tensor | None = None, bend: torch.Tensor | None = None, alpha: torch.Tensor | None = None,
+    n_eta: int = 24, n_omega: int = 48, generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """Area-uniform differentiable surface sampling with sanitized multinomial weights (no CUDA assert)."""
+    grid = sample_surface(scale, eps, R, t, n_eta, n_omega, taper, bend, alpha)        # (..., K, 3)
+    lead, K = grid.shape[:-2], grid.shape[-2]
+    g = grid.reshape(-1, K, 3)                                                          # (Q, K, 3)
+    faces = grid_faces(n_eta, n_omega, g.device)                                        # (F, 3)
+    tri = g[:, faces]                                                                   # (Q, F, 3, 3)
+    with torch.no_grad():
+        area = torch.linalg.cross(tri[:, :, 1] - tri[:, :, 0], tri[:, :, 2] - tri[:, :, 0]).norm(dim=-1)
+        weights = torch.nan_to_num(area, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(1e-8)
+        invalid = ~torch.isfinite(weights).all(dim=-1) | (weights.sum(dim=-1) <= 0)
+        if invalid.any():
+            weights = torch.where(invalid[:, None], torch.ones_like(weights), weights)
+        idx = torch.multinomial(weights, n, replacement=True, generator=generator)     # (Q, n)
+        u, v = torch.rand(2, *idx.shape, 1, device=g.device, generator=generator)
+        flip = (u + v) > 1
+        u, v = torch.where(flip, 1 - u, u), torch.where(flip, 1 - v, v)
+    t3 = torch.gather(tri, 1, idx[..., None, None].expand(-1, -1, 3, 3))                # (Q, n, 3, 3)
+    pts = t3[:, :, 0] + u * (t3[:, :, 1] - t3[:, :, 0]) + v * (t3[:, :, 2] - t3[:, :, 0])
+    return pts.reshape(*lead, n, 3)
+
+
 def _geo_surface_loss(
     pred_sq: dict, tgt: dict, wt: torch.Tensor, m: torch.Tensor, n: torch.Tensor,
     rep, deform: bool, geo_loss: str, repeat: int,
@@ -264,28 +308,43 @@ def _geo_surface_loss(
         return ((d_slot * wt) * m).sum() / n
 
     if geo_loss == "chamfer":
-        deform_p = (pred_sq["taper"], pred_sq["bend"], pred_sq["alpha"]) if deform else (None, None, None)
-        p_all = sample_surface_uniform(pred_sq["scale"], pred_sq["eps"], pred_sq["R"], pred_sq["t"],
-                                       n_geo_points, *deform_p, generator=generator)        # (B,P,S,3)
+        active = m > 0.5
+        if not active.any():
+            return pred_sq["t"].sum() * 0.0
+        p_clean = _sanitize_sq_for_sampling(pred_sq, deform)
+        deform_p = (p_clean["taper"][active], p_clean["bend"][active], p_clean["alpha"][active]) if deform else (None, None, None)
+        p_flat = _safe_sample_surface_uniform(
+            p_clean["scale"][active], p_clean["eps"][active], p_clean["R"][active], p_clean["t"][active],
+            n_geo_points, *deform_p, generator=generator,
+        )                                                                                   # (N_act, S, 3)
+        counts = active.sum(dim=1).tolist()
+        p_per_b = torch.split(p_flat, counts, dim=0)
         has_surf = "surf" in tgt
         if has_surf:
             g_surf = rep(tgt["surf"])
         else:
             with torch.no_grad():
-                deform_g = (rep(tgt["taper"]), rep(tgt["bend"]), rep(tgt["alpha"])) if deform else (None, None, None)
-                g_all = sample_surface_uniform(rep(tgt["scale"]), rep(tgt["eps"]), rep(tgt["R"]), rep(tgt["t"]),
-                                               n_geo_points, *deform_g, generator=generator)
+                t_clean = _sanitize_sq_for_sampling({
+                    "scale": rep(tgt["scale"]), "eps": rep(tgt["eps"]),
+                    "R": rep(tgt["R"]), "t": rep(tgt["t"]),
+                    **({k: rep(tgt[k]) for k in ("taper", "bend", "alpha")} if deform else {}),
+                }, deform)
+                deform_g = (t_clean["taper"][active], t_clean["bend"][active], t_clean["alpha"][active]) if deform else (None, None, None)
+                g_flat = _safe_sample_surface_uniform(
+                    t_clean["scale"][active], t_clean["eps"][active], t_clean["R"][active], t_clean["t"][active],
+                    n_geo_points, *deform_g, generator=generator,
+                )
+                g_per_b = torch.split(g_flat, counts, dim=0)
         s_vec = rep(tgt["s"]) if "s" in tgt else None
         losses = []
-        for b in range(p_all.shape[0]):
-            mb = m[b] > 0.5
-            if not mb.any():
+        for b, cnt in enumerate(counts):
+            if cnt == 0:
                 continue
-            p_b = p_all[b, mb].reshape(-1, 3)
-            g_b = g_surf[b] if has_surf else g_all[b, mb].reshape(-1, 3)
+            p_b = p_per_b[b].reshape(-1, 3)
+            g_b = g_surf[b] if has_surf else g_per_b[b].reshape(-1, 3)
             sb = s_vec[b] if s_vec is not None else 1.0
             losses.append(wt[b, 0] * chamfer(p_b, g_b) * sb)
-        return torch.stack(losses).mean() if losses else p_all.sum() * 0.0
+        return torch.stack(losses).mean() if losses else pred_sq["t"].sum() * 0.0
 
     raise ValueError(f"unknown geo_loss {geo_loss!r}")
 
