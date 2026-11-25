@@ -210,6 +210,43 @@ def test_train_py_flow_wiring() -> None:
         assert r_empty["all"]["n_empty"] == 2 and np.isnan(r_empty["all"]["chamfer_world"])
         print(f"empty-pred eval check: n_empty={r_empty['all']['n_empty']}, chamfer={r_empty['all']['chamfer_world']}")
 
+        # Verify --grad-clip 0 (default off) matches today's behavior identically, and --grad-clip > 0 skips bad steps
+        out_gc_default = Path(tmp) / "run_gc_default"
+        out_gc_zero = Path(tmp) / "run_gc_zero"
+        common_args = [
+            "--train", "fake_train", "--test", "fake_test", "--gt-sq", "fake.npz",
+            "--decoder", "flow", "--layers", "1", "--d-model", "64", "--heads", "4", "--ffn", "128",
+            "--steps", "2", "--log-every", "2", "--eval-every", "2", "--eval-per-n", "1",
+            "--examples", "1", "--batch", "2", "--n-surf", "64", "--n-vol", "64",
+            "--flow-steps", "4", "--device", "cpu", "--seed", "0", "--no-tb",
+        ]
+        train_mod.main([*common_args, "--out", str(out_gc_default)])
+        train_mod.main([*common_args, "--out", str(out_gc_zero), "--grad-clip", "0"])
+        args_gcd = json.loads((out_gc_default / "args.json").read_text())
+        assert args_gcd["grad_clip"] == 0.0
+        sd_def = torch.load(out_gc_default / "decoder.pt", map_location="cpu", weights_only=False)["decoder"]
+        sd_zero = torch.load(out_gc_zero / "decoder.pt", map_location="cpu", weights_only=False)["decoder"]
+        assert all(torch.equal(sd_def[k], sd_zero[k]) for k in sd_def)
+
+        # With --grad-clip > 0, non-finite loss skips opt.step() with a warning and keeps weights finite
+        import io
+        from contextlib import redirect_stderr
+        out_gc_skip = Path(tmp) / "run_gc_skip"
+        orig_fl = train_mod.flow_loss
+
+        def nan_flow_loss(dec, *args, **kwargs):
+            l, p = orig_fl(dec, *args, **kwargs)
+            return l + float("nan"), p
+
+        buf = io.StringIO()
+        with patch.object(train_mod, "flow_loss", side_effect=nan_flow_loss), redirect_stderr(buf):
+            train_mod.main([*common_args, "--out", str(out_gc_skip), "--grad-clip", "1.0"])
+        assert "skipping optimizer step" in buf.getvalue()
+        args_gcs = json.loads((out_gc_skip / "args.json").read_text())
+        assert args_gcs["grad_clip"] == 1.0
+        sd_skip = torch.load(out_gc_skip / "decoder.pt", map_location="cpu", weights_only=False)["decoder"]
+        assert all(torch.isfinite(v).all() for v in sd_skip.values())
+
 
 def test_flow_repeat() -> None:
     torch.manual_seed(0)
@@ -637,6 +674,93 @@ def test_flow_geo_loss() -> None:
     m_none = torch.zeros(B, P)
     g_empty = _geo_surface_loss(tgt, tgt, wt, m_none, m_none.sum().clamp_min(1.0), rep, False, "chamfer", 1)
     assert g_empty.item() == 0.0
+
+    # 5. Geo points robustness in deform mode: zero-scale, eps at clamp limits, non-finite SQ, and multi-step stability
+    tgt_def = {k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in tgt.items()}
+    tgt_def["taper"] = torch.zeros(B, P, 2) + 0.1
+    tgt_def["bend"] = torch.zeros(B, P, 3) + 0.2
+    tgt_def["alpha"] = torch.zeros(B, P, 3) + 0.4
+    tgt_def_nan_pad = {k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in tgt_def.items()}
+    tgt_def_nan_pad["scale"][:, -1] = float("nan")     # non-finite inactive teacher slot
+
+    x_bad_def = torch.zeros(B, P, 26)
+    x_bad_def[:, 0, 9:12] = -1e6                       # tiny/zero scale
+    x_bad_def[:, 1, 12:14] = torch.tensor([-1e6, 1e6]) # eps at EPS_MIN and EPS_MAX clamp limits
+    x_bad_def[:, 1, 3:9] = 0.0                         # zero rot6d
+    x_bad_def[:, 1, 20:26] = 0.0                       # zero bend direction
+    x_bad_def[:, 2, 3:9] = torch.tensor([1., 0., 0., 0., 1., 0.])
+    x_bad_def[:, 2, 9:12] = -1.5                       # finite active slot
+    x_bad_def[:, 3, :] = float("nan")                  # non-finite SQ (inactive slot)
+    x_bad_def[:, 0, 15:17] = float("inf")              # non-finite taper on active slot
+    x_bad_def.requires_grad_(True)
+    pred_bad_def = decode_sq(x_bad_def, normalized=False, smooth_exist=True, deform=True)
+    pred_bad_def_direct = {**pred_bad_def, "scale": pred_bad_def["scale"].clone()}
+    pred_bad_def_direct["scale"][:, 0] = 0.0           # literal zero scale
+    g_pts_bad = _geo_surface_loss(pred_bad_def_direct, tgt_def_nan_pad, wt, m, n, rep, True, "points", 1)
+    assert torch.isfinite(g_pts_bad)
+    g_pts_bad.backward()
+    assert x_bad_def.grad is not None and torch.isfinite(x_bad_def.grad).all()
+    assert x_bad_def.grad[:, 2, 0:3].abs().sum() > 0
+
+    # End-to-end flow_loss(geo_loss="points") in deform mode with extreme x1_hat (zero-scale, eps limits, overflow-prone)
+    class _ExtremeFlowWrapper(torch.nn.Module):
+        def __init__(self, base: FlowSQDenoiser):
+            super().__init__()
+            self.base = base
+            for attr in ("deform", "sq_dim", "fourier_freqs", "t_mean", "t_std", "flow_shift", "flow_scale"):
+                setattr(self, attr, getattr(base, attr))
+
+        def encode_tokens(self, toks):
+            return self.base.encode_tokens(toks)
+
+        def forward(self, x_t, t_in, mem=None, n_views=None):
+            v = self.base(x_t, t_in, mem=mem, n_views=n_views)
+            v = v.clone()
+            v[:, 0, 9:12] = v[:, 0, 9:12] - 1e6                # zero-scale SQ in x1_hat
+            v[:, 1, 12:14] = v[:, 1, 12:14] + torch.tensor([-1e6, 1e6])  # eps at clamp limits
+            v[:, 2, 3:9] = v[:, 2, 3:9] * 0.0                  # zero rot6d
+            v[:, 2, 20:26] = v[:, 2, 20:26] * 0.0              # zero bend direction
+            v[:, 3, 9:12] = v[:, 3, 9:12] + 1e6                # overflow/huge scale exponent
+            return v
+
+    den_def = FlowSQDenoiser(d_model=64, n_queries=P, n_layers=1, n_heads=4, ffn_dim=128, deform=True)
+    wrap_def = _ExtremeFlowWrapper(den_def)
+    wrap_def.zero_grad()
+    loss_ex, parts_ex = flow_loss(wrap_def, tokens, tgt_def, generator=torch.Generator().manual_seed(9),
+                                  mode="mix", w_x1=1.0, geo_loss="points", w_geo=20.0)
+    assert torch.isfinite(loss_ex) and np.isfinite(parts_ex["geo"])
+    loss_ex.backward()
+    grads_ex = [p.grad for p in den_def.parameters() if p.grad is not None]
+    assert len(grads_ex) > 0 and all(torch.isfinite(gr).all() for gr in grads_ex)
+
+    # Also test flow_loss(geo_loss="points") with x1_hat injected with NaN directly into decode_sq
+    import l2sq.flow_matching_decoder as fmd_mod
+    real_decode = fmd_mod.decode_sq
+
+    def _decode_with_nan_slot(x_hat, *args, **kwargs):
+        x_hat = x_hat.clone()
+        x_hat[:, 3, :] = float("nan")                  # non-finite SQ in x1_hat (active slot 3)
+        return real_decode(x_hat, *args, **kwargs)
+
+    den_def.zero_grad()
+    with patch.object(fmd_mod, "decode_sq", side_effect=_decode_with_nan_slot):
+        loss_nan_x1, parts_nan_x1 = flow_loss(wrap_def, tokens, tgt_def, generator=torch.Generator().manual_seed(11),
+                                              mode="mix", w_x1=1.0, geo_loss="points", w_geo=20.0)
+    assert torch.isfinite(loss_nan_x1) and np.isfinite(parts_nan_x1["geo"])
+    loss_nan_x1.backward()
+    grads_nan = [p.grad for p in den_def.parameters() if p.grad is not None]
+    assert len(grads_nan) > 0 and all(torch.isfinite(gr).all() for gr in grads_nan)
+
+    # Multi-step optimization stability at w_geo=20.0 in deform mode (regression for step-2 pole atan2 NaN)
+    den_stab = FlowSQDenoiser(d_model=64, n_queries=P, n_layers=1, n_heads=4, ffn_dim=128, deform=True)
+    opt_stab = torch.optim.AdamW(den_stab.parameters(), lr=2e-4)
+    for _ in range(10):
+        l_s, p_s = flow_loss(den_stab, tokens, tgt_def, mode="mix", w_x1=1.0, geo_loss="points", w_geo=20.0)
+        opt_stab.zero_grad()
+        l_s.backward()
+        gn_s = torch.nn.utils.clip_grad_norm_(den_stab.parameters(), 1.0)
+        assert torch.isfinite(l_s) and np.isfinite(p_s["geo"]) and torch.isfinite(gn_s)
+        opt_stab.step()
 
 
 if __name__ == "__main__":

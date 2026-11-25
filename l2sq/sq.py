@@ -41,8 +41,8 @@ def rot6d_to_matrix(x: torch.Tensor) -> torch.Tensor:
     The two 3-vectors are Gram-Schmidt orthonormalized and become the first two COLUMNS.
     """
     a1, a2 = x[..., :3], x[..., 3:6]
-    b1 = F.normalize(a1, dim=-1)
-    b2 = F.normalize(a2 - (b1 * a2).sum(-1, keepdim=True) * b1, dim=-1)
+    b1 = F.normalize(a1, dim=-1, eps=1e-6)
+    b2 = F.normalize(a2 - (b1 * a2).sum(-1, keepdim=True) * b1, dim=-1, eps=1e-6)
     b3 = torch.cross(b1, b2, dim=-1)
     return torch.stack([b1, b2, b3], dim=-1)
 
@@ -96,8 +96,8 @@ def min_radius(scale, taper):
 def _bend_axis(x, y, z, kb, alpha, axis: str):
     """SuperFlex bending around one axis (loss/utils.py parametric_to_points_extended)."""
     u, v, w = {"z": (x, y, z), "x": (y, z, x), "y": (z, x, y)}[axis]
-    beta = torch.atan2(v, u)
-    r = torch.sqrt(u ** 2 + v ** 2 + 1e-12) * torch.cos(alpha - beta)
+    # Equivalent to sqrt(u^2 + v^2) * cos(alpha - atan2(v, u)) without atan2/sqrt singularity at u=v=0.
+    r = u * torch.cos(alpha) + v * torch.sin(alpha)
     on = kb.abs() >= 1e-3
     kb = torch.where(on, kb, torch.full_like(kb, 1e-3))
     inv = 1.0 / kb
@@ -119,10 +119,11 @@ def sample_surface(scale, eps, R, t, n_eta: int = 16, n_omega: int = 32,
     co, so = _signed_pow(torch.cos(omega), e2), _signed_pow(torch.sin(omega), e2)
     x, y, z = scale[..., 0:1] * ce * co, scale[..., 1:2] * ce * so, scale[..., 2:3] * se
     if taper is not None:
-        zn = z / scale[..., 2:3]
+        zn = z / scale[..., 2:3].clamp_min(1e-6)
         x, y = x * (1 + taper[..., 0:1] * zn), y * (1 + taper[..., 1:2] * zn)
     if bend is not None:
-        kb = bend / min_radius(scale, taper if taper is not None else torch.zeros_like(scale[..., :2]))
+        mr = min_radius(scale, taper if taper is not None else torch.zeros_like(scale[..., :2])).clamp_min(1e-6)
+        kb = bend / mr
         for ch, axis in [(2, "y"), (1, "x"), (0, "z")]:
             x, y, z = _bend_axis(x, y, z, kb[..., ch:ch + 1], alpha[..., ch:ch + 1], axis)
     local = torch.stack([x, y, z], -1)

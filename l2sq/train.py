@@ -286,6 +286,8 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--w-geo", type=float, default=1.0, help="weight of --flow-geo loss")
     # optimization
     p.add_argument("--steps", type=int, default=3000)
+    p.add_argument("--grad-clip", type=float, default=0.0,
+                   help="max grad norm for safety guard (0 = off, default behavior); skips step with warning on non-finite loss/grad")
     p.add_argument("--batch", type=int, default=2, help="samples per step (each N views)")
     p.add_argument("--n-min", type=int, default=1)
     p.add_argument("--n-max", type=int, default=8)
@@ -504,8 +506,16 @@ def main(argv: list[str] | None = None) -> None:
             loss, parts = compute_loss(pred, tgt, cfg)
         opt.zero_grad(set_to_none=True)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(dec.parameters(), 1.0)
-        opt.step()
+        if a.grad_clip > 0:
+            grad_norm = torch.nn.utils.clip_grad_norm_(dec.parameters(), a.grad_clip)
+            if not (torch.isfinite(loss) and torch.isfinite(grad_norm)):
+                print(f"[warn] step {step}: non-finite loss ({loss.item()}) or grad norm ({float(grad_norm)}), "
+                      f"skipping optimizer step", file=sys.stderr)
+            else:
+                opt.step()
+        else:
+            torch.nn.utils.clip_grad_norm_(dec.parameters(), 1.0)
+            opt.step()
         sched.step()
         _sync()
         t_dec += time.perf_counter() - td0

@@ -76,6 +76,7 @@ def decode_sq(x: torch.Tensor, normalized: bool = True, smooth_exist: bool = Fal
               deform: bool | None = None) -> dict:
     """Convert flow sample (B, P, 15 or 26) back into valid SQ dict matching SQDecoder's output keys."""
     use_deform = (x.shape[-1] == DEFORM_DIM) if deform is None else deform
+    x = torch.nan_to_num(x, nan=0.0, posinf=1e4, neginf=-1e4)
     if normalized:
         sh, sc = _shift_scale(x, shift, scale)
         x = x * sc + sh
@@ -87,14 +88,17 @@ def decode_sq(x: torch.Tensor, normalized: bool = True, smooth_exist: bool = Fal
     exist_logit = (x[..., 14] - 0.5) * 8.0 if smooth_exist else torch.logit(x[..., 14].clamp(1e-4, 1.0 - 1e-4))
     out = {
         "t": t_out,
-        "R": rot6d_to_matrix(x[..., 3:9]),
+        "R": rot6d_to_matrix(x[..., 3:9].clamp(-1e4, 1e4)),
         "scale": torch.exp(x[..., 9:12].clamp(-10.0, 4.0)).clamp_min(SCALE_MIN),
         "eps": EPS_MIN + (EPS_MAX - EPS_MIN) * torch.sigmoid(x[..., 12:14]),
         "exist_logit": exist_logit,
     }
     if use_deform:
-        vec_cs = F.normalize(x[..., 20:26].unflatten(-1, (3, 2)), dim=-1)    # (..., 3, 2) = (cos, sin)
-        alpha = torch.atan2(vec_cs[..., 1], vec_cs[..., 0])
+        raw_cs = x[..., 20:26].unflatten(-1, (3, 2)).clamp(-1e4, 1e4)
+        vec_cs = F.normalize(raw_cs, dim=-1, eps=1e-6)                       # (..., 3, 2) = (cos, sin)
+        cs_ok = (raw_cs ** 2).sum(dim=-1, keepdim=True) >= 1e-12
+        cs_safe = torch.where(cs_ok, vec_cs, vec_cs.new_tensor([1.0, 0.0]).expand_as(vec_cs))
+        alpha = torch.atan2(cs_safe[..., 1], cs_safe[..., 0])
         alpha_vec = torch.stack([vec_cs[..., 1], vec_cs[..., 0]], dim=-1)    # (sin, cos) matching SQDecoder
         out.update(
             taper=x[..., 15:17].clamp(-1.0, 1.0),
@@ -246,19 +250,19 @@ class FlowSQDenoiser(nn.Module):
 
 
 def _sanitize_sq_for_sampling(sq: dict, deform: bool) -> dict:
-    """Clamp/clean SQ tensors to finite sane ranges for surface sampling while preserving finite gradients."""
-    scale = torch.where(torch.isfinite(sq["scale"]), sq["scale"], torch.full_like(sq["scale"], SCALE_MIN))
-    scale = scale.clamp(min=1e-4, max=50.0)
-    eps = torch.where(torch.isfinite(sq["eps"]), sq["eps"], torch.ones_like(sq["eps"])).clamp(min=EPS_MIN, max=EPS_MAX)
-    t = torch.where(torch.isfinite(sq["t"]), sq["t"], torch.zeros_like(sq["t"])).clamp(min=-50.0, max=50.0)
-    eye = torch.eye(3, device=sq["R"].device, dtype=sq["R"].dtype).expand_as(sq["R"])
+    """Clamp/clean SQ tensors to finite sane ranges for surface sampling without NaN backward leaks."""
+    scale = torch.nan_to_num(sq["scale"], nan=SCALE_MIN, posinf=50.0, neginf=1e-4).clamp(min=1e-4, max=50.0)
+    eps = torch.nan_to_num(sq["eps"], nan=1.0, posinf=EPS_MAX, neginf=EPS_MIN).clamp(min=EPS_MIN, max=EPS_MAX)
+    t = torch.nan_to_num(sq["t"], nan=0.0, posinf=50.0, neginf=-50.0).clamp(min=-50.0, max=50.0)
+    R_clean = torch.nan_to_num(sq["R"], nan=0.0, posinf=1.0, neginf=-1.0).clamp(-1.0, 1.0)
+    eye = torch.eye(3, device=R_clean.device, dtype=R_clean.dtype).expand_as(R_clean)
     r_ok = torch.isfinite(sq["R"]).all(dim=-1, keepdim=True).all(dim=-2, keepdim=True)
-    R = torch.where(r_ok, sq["R"], eye)
+    R = torch.where(r_ok, R_clean, eye)
     out = {"scale": scale, "eps": eps, "R": R, "t": t}
     if deform:
-        taper = torch.where(torch.isfinite(sq["taper"]), sq["taper"], torch.zeros_like(sq["taper"])).clamp(-0.99, 0.99)
-        bend = torch.where(torch.isfinite(sq["bend"]), sq["bend"], torch.full_like(sq["bend"], 1e-4)).clamp(1e-4, 1.0 - 1e-4)
-        alpha = torch.where(torch.isfinite(sq["alpha"]), sq["alpha"], torch.zeros_like(sq["alpha"]))
+        taper = torch.nan_to_num(sq["taper"], nan=0.0, posinf=0.99, neginf=-0.99).clamp(-0.99, 0.99)
+        bend = torch.nan_to_num(sq["bend"], nan=0.0, posinf=1.0 - 1e-4, neginf=0.0).clamp(0.0, 1.0 - 1e-4)
+        alpha = torch.nan_to_num(sq["alpha"], nan=0.0, posinf=math.pi, neginf=-math.pi).clamp(-1e4, 1e4)
         out.update(taper=taper, bend=bend, alpha=alpha)
     return out
 
@@ -296,13 +300,21 @@ def _geo_surface_loss(
 ) -> torch.Tensor:
     """t-weighted surface geometry loss on one-step clean estimates x1_hat ('points' or 'chamfer')."""
     if geo_loss == "points":
+        if not (m > 0.5).any():
+            return pred_sq["t"].sum() * 0.0
+        p_clean = _sanitize_sq_for_sampling(pred_sq, deform)
         # Fixed deterministic 8x16 = 128-point (eta, omega) grid per SQ; preserves slot & point correspondence.
-        deform_p = (pred_sq["taper"], pred_sq["bend"], pred_sq["alpha"]) if deform else (None, None, None)
-        p_pts = sample_surface(pred_sq["scale"], pred_sq["eps"], pred_sq["R"], pred_sq["t"],
+        deform_p = (p_clean["taper"], p_clean["bend"], p_clean["alpha"]) if deform else (None, None, None)
+        p_pts = sample_surface(p_clean["scale"], p_clean["eps"], p_clean["R"], p_clean["t"],
                                8, 16, *deform_p)                                            # (B,P,128,3)
         with torch.no_grad():
-            deform_g = (rep(tgt["taper"]), rep(tgt["bend"]), rep(tgt["alpha"])) if deform else (None, None, None)
-            g_pts = sample_surface(rep(tgt["scale"]), rep(tgt["eps"]), rep(tgt["R"]), rep(tgt["t"]),
+            t_clean = _sanitize_sq_for_sampling({
+                "scale": rep(tgt["scale"]), "eps": rep(tgt["eps"]),
+                "R": rep(tgt["R"]), "t": rep(tgt["t"]),
+                **({k: rep(tgt[k]) for k in ("taper", "bend", "alpha")} if deform else {}),
+            }, deform)
+            deform_g = (t_clean["taper"], t_clean["bend"], t_clean["alpha"]) if deform else (None, None, None)
+            g_pts = sample_surface(t_clean["scale"], t_clean["eps"], t_clean["R"], t_clean["t"],
                                    8, 16, *deform_g)                                        # (B,P,128,3)
         d_slot = ((p_pts - g_pts) ** 2).sum(dim=-1).mean(dim=-1)                           # (B,P)
         return ((d_slot * wt) * m).sum() / n
