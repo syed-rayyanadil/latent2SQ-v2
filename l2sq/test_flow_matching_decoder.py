@@ -387,11 +387,24 @@ def test_flow_norm_all() -> None:
     assert torch.isfinite(l_def)
 
 
+def test_slot_init_sinus() -> None:
+    from l2sq.model import sinusoidal
+
+    B = 2
+    denoiser = FlowSQDenoiser(d_model=256, n_queries=16, n_layers=1, n_heads=8, ffn_dim=256, slot_init="sinus")
+    expected = sinusoidal(16, 256)
+    assert denoiser.slot_emb.shape == (1, 16, 256)
+    assert torch.equal(denoiser.slot_emb.squeeze(0), expected)
+    out = denoiser(torch.randn(B, 16, 15), torch.rand(B), tokens=torch.randn(B, 2, 8, TOKEN_DIM))
+    assert out.shape == (B, 16, 15) and torch.isfinite(out).all()
+
+
 if __name__ == "__main__":
     test_overfit_one_batch()
     test_flow_repeat()
     test_flow_loss_mix()
     test_flow_t_norm()
     test_flow_norm_all()
+    test_slot_init_sinus()
     test_train_py_flow_wiring()
     print("\nALL CPU FLOW TESTS PASSED")

@@ -267,6 +267,8 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--flow-t-norm", action="store_true", help="per-axis (t - mean) / std normalization in flow space")
     p.add_argument("--flow-norm-all", action="store_true",
                    help="per-dim (x - mean) / std over all SQ groups (t, rot6d, log-scale, eps logit) in flow space")
+    p.add_argument("--flow-slot-sinus", action="store_true",
+                   help="initialize FlowSQDenoiser.slot_emb with sinusoidal embeddings instead of N(0, 0.02^2)")
     # optimization
     p.add_argument("--steps", type=int, default=3000)
     p.add_argument("--batch", type=int, default=2, help="samples per step (each N views)")
@@ -365,7 +367,8 @@ def main(argv: list[str] | None = None) -> None:
     if a.decoder == "flow":
         s0 = collate(train_pool, [make_sample(train_pool, gt, [0])], a.queries, "cpu")
         print(f"flow x_1 raw min/max: {flow_group_stats(pack_sq(s0, normalize=False), s0['exist'])}", file=sys.stderr)
-        dec = FlowSQDenoiser(a.d_model, a.queries, a.layers, a.heads, a.ffn).to(device)
+        dec = FlowSQDenoiser(a.d_model, a.queries, a.layers, a.heads, a.ffn,
+                             slot_init="sinus" if a.flow_slot_sinus else "small").to(device)
         if a.flow_norm_all:
             stat_rng = np.random.default_rng(a.seed + 999)
             raw_vals = []

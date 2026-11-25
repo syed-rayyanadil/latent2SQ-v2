@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from l2sq.model import TOKEN_DIM
+from l2sq.model import TOKEN_DIM, sinusoidal
 from l2sq.sq import EPS_MAX, EPS_MIN, SCALE_MIN, rot6d_to_matrix
 
 SQ_DIM = 15  # t(3), rot6d(6), log_scale(3), eps_raw(2), exist(1)
@@ -127,14 +127,20 @@ class FlowSQDenoiser(nn.Module):
     """Predicts flow velocity v(x_t, t, tokens) of shape (B, P, 15) for CondOT flow matching."""
 
     def __init__(self, d_model: int = 256, n_queries: int = 16, n_layers: int = 4, n_heads: int = 8,
-                 ffn_dim: int = 1024, dropout: float = 0.0, ref_embedding: bool = True):
+                 ffn_dim: int = 1024, dropout: float = 0.0, ref_embedding: bool = True,
+                 slot_init: str = "small"):
         super().__init__()
         self.deform = False
         self.in_norm = nn.LayerNorm(TOKEN_DIM)
         self.in_proj = nn.Linear(TOKEN_DIM, d_model)
         self.ref_embedding = nn.Parameter(torch.zeros(d_model)) if ref_embedding else None
         self.x_proj = nn.Linear(SQ_DIM, d_model)
-        self.slot_emb = nn.Parameter(torch.randn(1, n_queries, d_model) * 0.02)
+        if slot_init == "small":
+            self.slot_emb = nn.Parameter(torch.randn(1, n_queries, d_model) * 0.02)
+        elif slot_init == "sinus":
+            self.slot_emb = nn.Parameter(sinusoidal(n_queries, d_model).unsqueeze(0))
+        else:
+            raise ValueError(f"unknown slot_init {slot_init!r}, expected 'small' or 'sinus'")
         self.t_embedder = TimestepEmbedder(d_model)
         self.view_embedder = TimestepEmbedder(d_model)
         self.blocks = nn.ModuleList([FlowSQBlock(d_model, n_heads, ffn_dim, dropout) for _ in range(n_layers)])
