@@ -163,7 +163,8 @@ def evaluate(vggt, dec, pool, samples_by_n, P, batch, device, cfg: dict, geom: G
             tokens = vggt(tgt["images"])
             if cfg.get("decoder", "parallel") == "flow":
                 pred = decode_sq(sample_euler(dec, tokens, n_queries=P, n_steps=cfg.get("flow_steps", 20), generator=gen),
-                                 t_mean=dec.t_mean, t_std=dec.t_std, shift=dec.flow_shift, scale=dec.flow_scale)
+                                 t_mean=dec.t_mean, t_std=dec.t_std, shift=dec.flow_shift, scale=dec.flow_scale,
+                                 deform=dec.deform)
                 loss, _ = flow_loss(dec, tokens, tgt, generator=gen, vel_loss=cfg.get("flow_vel_loss", "mse"))
             else:
                 pred = dec(tokens)
@@ -212,7 +213,8 @@ def export_examples(vggt, dec, pool, samples, split, P, device, folder: Path,
         tgt = collate(pool, [smp], P, device)
         tokens = vggt(tgt["images"])
         raw_pred = (decode_sq(sample_euler(dec, tokens, n_queries=P, n_steps=flow_steps, generator=gen),
-                              t_mean=dec.t_mean, t_std=dec.t_std, shift=dec.flow_shift, scale=dec.flow_scale)
+                              t_mean=dec.t_mean, t_std=dec.t_std, shift=dec.flow_shift, scale=dec.flow_scale,
+                              deform=dec.deform)
                     if decoder == "flow" else dec(tokens))
         pred = {key: v.cpu() for key, v in raw_pred.items()}
         tgt = {key: (v.cpu() if isinstance(v, torch.Tensor) else v) for key, v in tgt.items()}
@@ -249,7 +251,7 @@ def main(argv: list[str] | None = None) -> None:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--train", required=True, help="render folder of the training views (with depth/)")
     p.add_argument("--test", required=True, help="render folder of the test views (different cameras)")
-    p.add_argument("--gt-sq", required=True, help="rigid pseudo-GT superquadrics, world frame (.npz)")
+    p.add_argument("--gt-sq", required=True, help="pseudo-GT superquadrics, world frame (.npz; --deform/--flow-deform: gt_sq_deform.npz)")
     p.add_argument("--out", required=True, help="run folder")
     # model
     p.add_argument("--layers", type=int, default=1, help="decoder layers L")
@@ -273,6 +275,8 @@ def main(argv: list[str] | None = None) -> None:
                    help="Fourier frequency bands for x_t input embedding in FlowSQDenoiser (0 = off)")
     p.add_argument("--flow-vel-loss", choices=["mse", "l2"], default="mse",
                    help="flow velocity loss per SQ parameter group: mse or Euclidean norm (l2)")
+    p.add_argument("--flow-deform", action="store_true",
+                   help="deformable 26-dim SQs for --decoder flow (pass gt_sq_deform.npz to --gt-sq)")
     # optimization
     p.add_argument("--steps", type=int, default=3000)
     p.add_argument("--batch", type=int, default=2, help="samples per step (each N views)")
@@ -352,11 +356,12 @@ def main(argv: list[str] | None = None) -> None:
     cfg = {**loss_config(vars(a)), "n_surf": a.n_surf, "n_vol": a.n_vol,
            "decoder": a.decoder, "flow_steps": a.flow_steps, "flow_vel_loss": a.flow_vel_loss}
     if a.decoder == "flow" and a.deform:
-        sys.exit("--decoder flow supports rigid 15-dim SQs only (omit --deform).")
+        sys.exit("--decoder flow does not take --deform (use --flow-deform with --gt-sq gt_sq_deform.npz).")
+    use_deform = a.flow_deform if a.decoder == "flow" else a.deform
 
     print("loading views and pseudo-GT ...", file=sys.stderr)
     train_pool, test_pool = ViewPool(a.train), ViewPool(a.test)
-    gt = GTSuperquadrics(a.gt_sq, deform=a.deform)
+    gt = GTSuperquadrics(a.gt_sq, deform=use_deform)
     geom = GeomTargets(a.gt_world, Path(a.train) / "cameras.json", seed=a.seed)
     print(f"GT geometry: {len(geom.surf)} surface points, {len(geom.vol)} volume points "
           f"({100 * geom.occ.mean():.1f}% inside); loss: {a.loss}", file=sys.stderr)
@@ -370,10 +375,10 @@ def main(argv: list[str] | None = None) -> None:
     vggt = FrozenVGGT(a.vggt_layer).to(device)
     if a.decoder == "flow":
         s0 = collate(train_pool, [make_sample(train_pool, gt, [0])], a.queries, "cpu")
-        print(f"flow x_1 raw min/max: {flow_group_stats(pack_sq(s0, normalize=False), s0['exist'])}", file=sys.stderr)
+        print(f"flow x_1 raw min/max: {flow_group_stats(pack_sq(s0, normalize=False, deform=a.flow_deform), s0['exist'])}", file=sys.stderr)
         dec = FlowSQDenoiser(a.d_model, a.queries, a.layers, a.heads, a.ffn,
                              slot_init="sinus" if a.flow_slot_sinus else "small",
-                             fourier_freqs=a.flow_fourier).to(device)
+                             fourier_freqs=a.flow_fourier, deform=a.flow_deform).to(device)
         if a.flow_norm_all:
             stat_rng = np.random.default_rng(a.seed + 999)
             raw_vals = []
@@ -381,17 +386,20 @@ def main(argv: list[str] | None = None) -> None:
                 n = int(stat_rng.integers(a.n_min, a.n_max + 1))
                 b_smp = collate(train_pool, [make_sample(train_pool, gt, random_views(stat_rng, len(train_pool), n))],
                                 a.queries, "cpu")
-                raw_vals.append(pack_sq(b_smp, normalize=False)[b_smp["exist"] > 0.5])
+                raw_vals.append(pack_sq(b_smp, normalize=False, deform=a.flow_deform)[b_smp["exist"] > 0.5])
             all_raw = torch.cat(raw_vals, dim=0)
             mean_all = all_raw.mean(dim=0)
             std_all = all_raw.std(dim=0, unbiased=False).clamp_min(0.05)
-            sh = torch.cat([mean_all[:14], torch.tensor([0.5])])
-            sc = torch.cat([std_all[:14], torch.tensor([0.5])])
+            sh = torch.cat([mean_all[:14], torch.tensor([0.5]), mean_all[15:]])
+            sc = torch.cat([std_all[:14], torch.tensor([0.5]), std_all[15:]])
             dec.set_flow_norm(sh, sc)
+            groups = [("t", slice(0, 3)), ("rot6d", slice(3, 9)), ("log_scale", slice(9, 12)),
+                      ("eps", slice(12, 14)), ("exist", slice(14, 15))]
+            if a.flow_deform:
+                groups += [("taper", slice(15, 17)), ("bend", slice(17, 20)), ("alpha", slice(20, 26))]
             print("flow norm_all (64 train samples, std>=0.05):",
                   {k: (np.round(sh[s].tolist(), 3).tolist(), np.round(sc[s].tolist(), 3).tolist())
-                   for k, s in [("t", slice(0, 3)), ("rot6d", slice(3, 9)), ("log_scale", slice(9, 12)),
-                                ("eps", slice(12, 14)), ("exist", slice(14, 15))]}, file=sys.stderr)
+                   for k, s in groups}, file=sys.stderr)
         elif a.flow_t_norm:
             stat_rng = np.random.default_rng(a.seed + 999)
             t_vals = []

@@ -47,6 +47,7 @@ def load_decoder(ckpt_path: str | Path, device: str) -> tuple[str, torch.nn.Modu
             args["d_model"], args["queries"], args["layers"], args["heads"], args["ffn"],
             slot_init="sinus" if args.get("flow_slot_sinus", False) else "small",
             fourier_freqs=args.get("flow_fourier", 0),
+            deform=args.get("flow_deform", False),
         )
         dec.load_state_dict(ckpt["decoder"])
         if "t_mean" not in ckpt["decoder"] and "t_mean" in args and "t_std" in args:
@@ -199,6 +200,7 @@ def _eval_batches(
                 x_k,
                 t_mean=dec_flow.t_mean, t_std=dec_flow.t_std,
                 shift=dec_flow.flow_shift, scale=dec_flow.flow_scale,
+                deform=dec_flow.deform,
             )
             draw_metrics.append(_per_sample_metrics(pred_k, tgt, surf_gen_f))
             draw_t_world.append(pred_k["t"] * s)
@@ -398,7 +400,7 @@ def main(argv: list[str] | None = None) -> None:
     per_n = a.per_n or args_f.get("eval_per_n", 8)
 
     test_pool = ViewPool(test_dir)
-    gt = GTSuperquadrics(gt_sq_path, deform=dec_parallel.deform)
+    gt = GTSuperquadrics(gt_sq_path, deform=dec_parallel.deform or dec_flow.deform)
     geom = GeomTargets(gt_world_path, Path(test_dir) / "cameras.json", seed=0)
     vggt = FrozenVGGT(args_f["vggt_layer"]).to(a.device)
 

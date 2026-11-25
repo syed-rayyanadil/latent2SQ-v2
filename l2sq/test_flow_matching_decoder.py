@@ -102,13 +102,19 @@ def test_train_py_flow_wiring() -> None:
             return 2.0
 
     class FakeGT:
-        deform = False
         def __init__(self, path, deform: bool = False):
             t = _fake_tgt(1, 16, 7)
+            self.deform = deform
             self.R = t["R"][0, :7].numpy()
             self.t = t["t"][0, :7].numpy()
             self.scale = t["scale"][0, :7].numpy()
             self.eps = t["eps"][0, :7].numpy()
+            if deform:
+                self.taper = np.full((7, 2), 0.25, dtype=np.float64)
+                self.bend = np.full((7, 3), 0.15, dtype=np.float64)
+                self.alpha = np.full((7, 3), 0.5, dtype=np.float64)
+            else:
+                self.taper = self.bend = self.alpha = None
         def __len__(self) -> int:
             return 7
 
@@ -166,6 +172,24 @@ def test_train_py_flow_wiring() -> None:
         assert torch.allclose(ckpt_all["decoder"]["t_mean"], torch.zeros(3))
         assert ckpt_all["decoder"]["flow_shift"][14].item() == 0.5 and ckpt_all["decoder"]["flow_scale"][14].item() == 0.5
         assert (ckpt_all["decoder"]["flow_scale"][:14] >= 0.05).all()
+
+        out_def = Path(tmp) / "run_flow_deform"
+        train_mod.main([
+            "--train", "fake_train", "--test", "fake_test", "--gt-sq", "fake_deform.npz",
+            "--out", str(out_def), "--decoder", "flow", "--flow-deform", "--flow-norm-all",
+            "--flow-loss", "mix", "--flow-vel-loss", "l2", "--flow-slot-sinus", "--flow-fourier", "2",
+            "--layers", "1", "--d-model", "64", "--heads", "4", "--ffn", "128",
+            "--steps", "1", "--log-every", "1", "--eval-every", "1", "--eval-per-n", "1",
+            "--examples", "1", "--batch", "2", "--n-surf", "64", "--n-vol", "64",
+            "--flow-steps", "4", "--device", "cpu", "--no-tb",
+        ])
+        args_def = json.loads((out_def / "args.json").read_text())
+        assert args_def["flow_deform"] is True and args_def["flow_fourier"] == 2 and args_def["flow_vel_loss"] == "l2"
+        final_def = json.loads((out_def / "eval_final.json").read_text())
+        assert "taper_err" in final_def["test"]["all"] and "bend_err" in final_def["test"]["all"]
+        ckpt_def = torch.load(out_def / "decoder.pt", map_location="cpu", weights_only=False)
+        assert ckpt_def["decoder"]["flow_shift"].shape == (26,) and ckpt_def["decoder"]["flow_scale"].shape == (26,)
+        assert ckpt_def["decoder"]["flow_shift"][14].item() == 0.5 and ckpt_def["decoder"]["flow_scale"][14].item() == 0.5
 
         # Verify evaluate() counts empty predictions and uses nanmean safely
         class EmptyDec(torch.nn.Module):
@@ -451,6 +475,70 @@ def test_fourier_and_l2_vel_loss() -> None:
     assert all(torch.isfinite(p.grad).all() for p in den_f.parameters() if p.grad is not None)
 
 
+def test_flow_deform() -> None:
+    from l2sq.eval_occlusion import load_decoder
+
+    torch.manual_seed(0)
+    B, P, M = 2, 16, 7
+    tgt = _fake_tgt(B, P, M, seed=21)
+    g = torch.Generator().manual_seed(22)
+    tgt["taper"] = torch.rand(B, P, 2, generator=g) * 1.8 - 0.9
+    tgt["bend"] = torch.rand(B, P, 3, generator=g) * 0.95 + 0.01
+    tgt["alpha"] = torch.rand(B, P, 3, generator=g) * (2.0 * np.pi) - np.pi
+
+    # 1. 26-dim pack/decode round trip (angle -> (cos, sin) -> atan2 angle, normalized and unnormalized)
+    raw = pack_sq(tgt, normalize=False, deform=True)
+    assert raw.shape == (B, P, 26)
+    expected_cs = torch.stack([tgt["alpha"].cos(), tgt["alpha"].sin()], dim=-1).flatten(-2)
+    assert torch.allclose(raw[..., 20:26], expected_cs, atol=1e-6)
+
+    x_norm = pack_sq(tgt, normalize=True, deform=True)
+    assert x_norm.shape == (B, P, 26)
+    rt = decode_sq(x_norm, normalized=True, deform=True)
+    _assert_valid_sq(rt, B, P)
+    assert torch.allclose(rt["taper"][:, :M], tgt["taper"][:, :M], atol=1e-5)
+    assert torch.allclose(rt["bend"][:, :M], tgt["bend"][:, :M], atol=1e-4)
+    # Compare circular angle modulo 2*pi via (cos, sin)
+    assert torch.allclose(rt["alpha"][:, :M].cos(), tgt["alpha"][:, :M].cos(), atol=1e-5)
+    assert torch.allclose(rt["alpha"][:, :M].sin(), tgt["alpha"][:, :M].sin(), atol=1e-5)
+
+    # 2. Forward shape, sample_euler, and checkpoint reload with slot_init="sinus" & fourier_freqs=4
+    tokens = torch.randn(B, 2, 8, TOKEN_DIM)
+    den = FlowSQDenoiser(d_model=64, n_queries=P, n_layers=1, n_heads=4, ffn_dim=128,
+                         slot_init="sinus", fourier_freqs=4, deform=True)
+    assert den.sq_dim == 26 and den.deform is True
+    assert den.x_proj.in_features == 26 * (1 + 2 * 4)
+    assert den.out_proj.out_features == 26
+    v_out = den(torch.randn(B, P, 26), torch.rand(B), tokens=tokens)
+    assert v_out.shape == (B, P, 26) and torch.isfinite(v_out).all()
+
+    smp = sample_euler(den, tokens, n_queries=P, n_steps=3, generator=torch.Generator().manual_seed(5))
+    assert smp.shape == (B, P, 26) and torch.isfinite(smp).all()
+    dec_out = decode_sq(smp, t_mean=den.t_mean, t_std=den.t_std, shift=den.flow_shift, scale=den.flow_scale, deform=True)
+    assert set(("taper", "bend", "alpha", "alpha_vec")).issubset(dec_out.keys())
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ckpt_p = Path(tmp) / "deform_flow.pt"
+        args = {"d_model": 64, "queries": P, "layers": 1, "heads": 4, "ffn": 128,
+                "decoder": "flow", "flow_slot_sinus": True, "flow_fourier": 4, "flow_deform": True}
+        torch.save({"decoder": den.state_dict(), "args": args}, ckpt_p)
+        kind, rel, _, _ = load_decoder(ckpt_p, "cpu")
+        assert kind == "flow" and rel.deform and rel.sq_dim == 26 and rel.fourier_freqs == 4
+        assert torch.allclose(rel.flow_shift, den.flow_shift) and torch.allclose(rel.flow_scale, den.flow_scale)
+
+    # 3. flow_loss (velocity + mix, mse + l2) is finite with finite grads and reports new parts
+    for vel_mode in ("mse", "l2"):
+        den.zero_grad()
+        loss, parts = flow_loss(den, tokens, tgt, generator=torch.Generator().manual_seed(7),
+                                mode="mix", w_x1=1.0, vel_loss=vel_mode)
+        assert torch.isfinite(loss)
+        for key in ("taper", "bend", "alpha", "x1_taper", "x1_bend", "x1_alpha"):
+            assert key in parts and np.isfinite(parts[key])
+        loss.backward()
+        grads = [p.grad for p in den.parameters() if p.grad is not None]
+        assert len(grads) > 0 and all(torch.isfinite(gr).all() for gr in grads)
+
+
 if __name__ == "__main__":
     test_overfit_one_batch()
     test_flow_repeat()
@@ -459,5 +547,6 @@ if __name__ == "__main__":
     test_flow_norm_all()
     test_slot_init_sinus()
     test_fourier_and_l2_vel_loss()
+    test_flow_deform()
     test_train_py_flow_wiring()
     print("\nALL CPU FLOW TESTS PASSED")

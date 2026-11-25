@@ -17,6 +17,7 @@ from scipy.optimize import linear_sum_assignment
 
 from l2sq.data import GTSuperquadrics, ViewPool, collate
 from l2sq.flow_matching_decoder import (
+    DEFORM_GROUP_SLICES,
     GROUP_SLICES,
     FlowSQDenoiser,
     _shift_scale,
@@ -98,12 +99,13 @@ def main(argv: list[str] | None = None) -> None:
         args["d_model"], P, args["layers"], args["heads"], args["ffn"],
         slot_init="sinus" if args.get("flow_slot_sinus", False) else "small",
         fourier_freqs=args.get("flow_fourier", 0),
+        deform=args.get("flow_deform", False),
     ).to(a.device).eval()
     dec.load_state_dict(ckpt["decoder"])
     vggt = FrozenVGGT(args["vggt_layer"]).to(a.device)
 
     test_pool = ViewPool(args["test"])
-    gt = GTSuperquadrics(args["gt_sq"], deform=False)
+    gt = GTSuperquadrics(args["gt_sq"], deform=dec.deform)
     samples_by_n = eval_samples(test_pool, gt, (4, 8), per_n, a.seed)
 
     # Precompute VGGT tokens once per fixed test batch.
@@ -187,13 +189,15 @@ def main(argv: list[str] | None = None) -> None:
 
     # 5. Raw flow-space ranges (min/max) of sampled x_1 vs GT x_1
     print("\n5. Raw flow-space ranges (min, max) — GT vs Sampled (20 steps):")
-    gt_raw = torch.cat([pack_sq(tgt, normalize=False) for n in (4, 8) for tgt, _ in cached[n]], dim=0)
+    gt_raw = torch.cat([pack_sq(tgt, normalize=False, deform=dec.deform) for n in (4, 8) for tgt, _ in cached[n]], dim=0)
     gt_mask = torch.cat([tgt["exist"] > 0.5 for n in (4, 8) for tgt, _ in cached[n]], dim=0)
     smp_raw = torch.cat([_unnorm(x_smp, dec.t_mean, dec.t_std, dec.flow_shift, dec.flow_scale)
                          for n in (4, 8) for _, x_smp, _ in samples_20[n]], dim=0)
     smp_mask = smp_raw[..., 14] > 0.5
-    for name in ("t", "scale", "eps", "exist"):
-        sl = GROUP_SLICES[name]
+    slices = DEFORM_GROUP_SLICES if dec.deform else GROUP_SLICES
+    group_names = ("t", "scale", "eps", "exist", "taper", "bend", "alpha") if dec.deform else ("t", "scale", "eps", "exist")
+    for name in group_names:
+        sl = slices[name]
         g_vals = gt_raw[..., sl] if name == "exist" else gt_raw[..., sl][gt_mask]
         s_all = smp_raw[..., sl]
         s_act = s_all if (name == "exist" or not smp_mask.any()) else smp_raw[..., sl][smp_mask]

@@ -11,25 +11,44 @@ import torch.nn.functional as F
 from l2sq.model import TOKEN_DIM, sinusoidal
 from l2sq.sq import EPS_MAX, EPS_MIN, SCALE_MIN, rot6d_to_matrix
 
-SQ_DIM = 15  # t(3), rot6d(6), log_scale(3), eps_raw(2), exist(1)
+SQ_DIM = 15  # rigid: t(3), rot6d(6), log_scale(3), eps_raw(2), exist(1)
+DEFORM_DIM = 26  # + taper(2), bend_logit(3), alpha_cs(6)
 GROUP_SLICES = {"t": slice(0, 3), "R": slice(3, 9), "scale": slice(9, 12), "eps": slice(12, 14), "exist": slice(14, 15)}
+DEFORM_GROUP_SLICES = {
+    **GROUP_SLICES,
+    "taper": slice(15, 17),
+    "bend": slice(17, 20),
+    "alpha": slice(20, 26),
+}
 # Shift/scale per dim to map unconstrained x_1 roughly to [-1, 1] matching N(0, 1) noise.
 _SHIFT = [0.0] * 3 + [0.0] * 6 + [-2.5] * 3 + [0.0] * 2 + [0.5]
 _SCALE = [1.0] * 3 + [1.0] * 6 + [2.0] * 3 + [2.0] * 2 + [0.5]
+# Deformable dims: taper in [-1, 1] (0, 1); bend logit in [-9.2, ~0] (-4.5, 4.5); (cos, sin) in [-1, 1] (0, 1).
+_DEFORM_SHIFT = [0.0] * 2 + [-4.5] * 3 + [0.0] * 6
+_DEFORM_SCALE = [1.0] * 2 + [4.5] * 3 + [1.0] * 6
+
+
+def _default_shift_scale(dim: int, device, dtype) -> tuple[torch.Tensor, torch.Tensor]:
+    if dim == DEFORM_DIM:
+        sh, sc = _SHIFT + _DEFORM_SHIFT, _SCALE + _DEFORM_SCALE
+    else:
+        sh, sc = _SHIFT, _SCALE
+    return torch.tensor(sh, device=device, dtype=dtype), torch.tensor(sc, device=device, dtype=dtype)
 
 
 def _shift_scale(like: torch.Tensor, shift: torch.Tensor | None = None,
                  scale: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
     if shift is not None and scale is not None:
         return shift.to(like), scale.to(like).clamp_min(1e-6)
-    return (torch.tensor(_SHIFT, device=like.device, dtype=like.dtype),
-            torch.tensor(_SCALE, device=like.device, dtype=like.dtype))
+    return _default_shift_scale(like.shape[-1], like.device, like.dtype)
 
 
 def pack_sq(tgt: dict, normalize: bool = True,
             t_mean: torch.Tensor | None = None, t_std: torch.Tensor | None = None,
-            shift: torch.Tensor | None = None, scale: torch.Tensor | None = None) -> torch.Tensor:
-    """Pack target dict -> unconstrained (B, P, 15) flow target x_1 (optionally group-normalized)."""
+            shift: torch.Tensor | None = None, scale: torch.Tensor | None = None,
+            deform: bool | None = None) -> torch.Tensor:
+    """Pack target dict -> unconstrained (B, P, 15 or 26) flow target x_1 (optionally group-normalized)."""
+    use_deform = ("taper" in tgt) if deform is None else deform
     R = tgt["R"]
     t_val = tgt["t"]
     if normalize and t_mean is not None and t_std is not None:
@@ -37,7 +56,14 @@ def pack_sq(tgt: dict, normalize: bool = True,
     rot6d = torch.cat([R[..., :, 0], R[..., :, 1]], dim=-1)
     log_scale = torch.log(tgt["scale"].clamp_min(SCALE_MIN))
     eps_u = ((tgt["eps"] - EPS_MIN) / (EPS_MAX - EPS_MIN)).clamp(1e-4, 1.0 - 1e-4)
-    raw = torch.cat([t_val, rot6d, log_scale, torch.logit(eps_u), tgt["exist"].unsqueeze(-1)], dim=-1)
+    parts = [t_val, rot6d, log_scale, torch.logit(eps_u), tgt["exist"].unsqueeze(-1)]
+    if use_deform:
+        taper = tgt["taper"].clamp(-1.0, 1.0)
+        bend_logit = torch.logit(tgt["bend"].clamp(1e-4, 1.0 - 1e-4))
+        alpha = tgt["alpha"]
+        alpha_cs = torch.stack([alpha.cos(), alpha.sin()], dim=-1).flatten(-2)
+        parts.extend([taper, bend_logit, alpha_cs])
+    raw = torch.cat(parts, dim=-1)
     if not normalize:
         return raw
     sh, sc = _shift_scale(raw, shift, scale)
@@ -46,8 +72,10 @@ def pack_sq(tgt: dict, normalize: bool = True,
 
 def decode_sq(x: torch.Tensor, normalized: bool = True, smooth_exist: bool = False,
               t_mean: torch.Tensor | None = None, t_std: torch.Tensor | None = None,
-              shift: torch.Tensor | None = None, scale: torch.Tensor | None = None) -> dict:
-    """Convert flow sample (B, P, 15) back into valid SQ dict matching SQDecoder's output keys."""
+              shift: torch.Tensor | None = None, scale: torch.Tensor | None = None,
+              deform: bool | None = None) -> dict:
+    """Convert flow sample (B, P, 15 or 26) back into valid SQ dict matching SQDecoder's output keys."""
+    use_deform = (x.shape[-1] == DEFORM_DIM) if deform is None else deform
     if normalized:
         sh, sc = _shift_scale(x, shift, scale)
         x = x * sc + sh
@@ -57,20 +85,32 @@ def decode_sq(x: torch.Tensor, normalized: bool = True, smooth_exist: bool = Fal
     # In flow space, GT existence is 0 or 1 (threshold 0.5). For differentiable BCE in mix loss,
     # map (exist - 0.5) * 8.0 to an unbounded logit centered at 0.5 so gradients never vanish.
     exist_logit = (x[..., 14] - 0.5) * 8.0 if smooth_exist else torch.logit(x[..., 14].clamp(1e-4, 1.0 - 1e-4))
-    return {
+    out = {
         "t": t_out,
         "R": rot6d_to_matrix(x[..., 3:9]),
         "scale": torch.exp(x[..., 9:12].clamp(-10.0, 4.0)).clamp_min(SCALE_MIN),
         "eps": EPS_MIN + (EPS_MAX - EPS_MIN) * torch.sigmoid(x[..., 12:14]),
         "exist_logit": exist_logit,
     }
+    if use_deform:
+        vec_cs = F.normalize(x[..., 20:26].unflatten(-1, (3, 2)), dim=-1)    # (..., 3, 2) = (cos, sin)
+        alpha = torch.atan2(vec_cs[..., 1], vec_cs[..., 0])
+        alpha_vec = torch.stack([vec_cs[..., 1], vec_cs[..., 0]], dim=-1)    # (sin, cos) matching SQDecoder
+        out.update(
+            taper=x[..., 15:17].clamp(-1.0, 1.0),
+            bend=torch.sigmoid(x[..., 17:20].clamp(-10.0, 10.0)),
+            alpha_vec=alpha_vec,
+            alpha=alpha,
+        )
+    return out
 
 
 def flow_group_stats(x_raw: torch.Tensor, mask: torch.Tensor | None = None) -> dict[str, tuple[float, float]]:
     """Compute (min, max) per parameter group on unconstrained x_1."""
     m = (mask > 0.5) if mask is not None else None
+    slices = DEFORM_GROUP_SLICES if x_raw.shape[-1] == DEFORM_DIM else GROUP_SLICES
     out = {}
-    for name, sl in GROUP_SLICES.items():
+    for name, sl in slices.items():
         vals = x_raw[..., sl] if (m is None or name == "exist") else x_raw[..., sl][m]
         out[name] = (float(vals.min()), float(vals.max()))
     return out
@@ -124,20 +164,21 @@ class FlowSQBlock(nn.Module):
 
 
 class FlowSQDenoiser(nn.Module):
-    """Predicts flow velocity v(x_t, t, tokens) of shape (B, P, 15) for CondOT flow matching."""
+    """Predicts flow velocity v(x_t, t, tokens) of shape (B, P, 15 or 26) for CondOT flow matching."""
 
     def __init__(self, d_model: int = 256, n_queries: int = 16, n_layers: int = 4, n_heads: int = 8,
                  ffn_dim: int = 1024, dropout: float = 0.0, ref_embedding: bool = True,
-                 slot_init: str = "small", fourier_freqs: int = 0):
+                 slot_init: str = "small", fourier_freqs: int = 0, deform: bool = False):
         super().__init__()
         if fourier_freqs < 0:
             raise ValueError(f"fourier_freqs must be >= 0, got {fourier_freqs}")
-        self.deform = False
+        self.deform = deform
+        self.sq_dim = DEFORM_DIM if deform else SQ_DIM
         self.fourier_freqs = fourier_freqs
         self.in_norm = nn.LayerNorm(TOKEN_DIM)
         self.in_proj = nn.Linear(TOKEN_DIM, d_model)
         self.ref_embedding = nn.Parameter(torch.zeros(d_model)) if ref_embedding else None
-        in_dim = SQ_DIM * (1 + 2 * fourier_freqs)
+        in_dim = self.sq_dim * (1 + 2 * fourier_freqs)
         self.x_proj = nn.Linear(in_dim, d_model)
         if slot_init == "small":
             self.slot_emb = nn.Parameter(torch.randn(1, n_queries, d_model) * 0.02)
@@ -149,13 +190,14 @@ class FlowSQDenoiser(nn.Module):
         self.view_embedder = TimestepEmbedder(d_model)
         self.blocks = nn.ModuleList([FlowSQBlock(d_model, n_heads, ffn_dim, dropout) for _ in range(n_layers)])
         self.out_norm = nn.LayerNorm(d_model)
-        self.out_proj = nn.Linear(d_model, SQ_DIM)
-        self.x_skip = nn.Linear(SQ_DIM, SQ_DIM)
-        self.t_scale = nn.Sequential(nn.SiLU(), nn.Linear(d_model, SQ_DIM))
+        self.out_proj = nn.Linear(d_model, self.sq_dim)
+        self.x_skip = nn.Linear(self.sq_dim, self.sq_dim)
+        self.t_scale = nn.Sequential(nn.SiLU(), nn.Linear(d_model, self.sq_dim))
         self.register_buffer("t_mean", torch.zeros(3))
         self.register_buffer("t_std", torch.ones(3))
-        self.register_buffer("flow_shift", torch.tensor(_SHIFT, dtype=torch.float32))
-        self.register_buffer("flow_scale", torch.tensor(_SCALE, dtype=torch.float32))
+        sh, sc = _default_shift_scale(self.sq_dim, torch.device("cpu"), torch.float32)
+        self.register_buffer("flow_shift", sh)
+        self.register_buffer("flow_scale", sc)
 
     def set_t_norm(self, mean: torch.Tensor, std: torch.Tensor) -> None:
         with torch.no_grad():
@@ -216,7 +258,7 @@ def flow_loss(denoiser: FlowSQDenoiser, tokens: torch.Tensor, tgt: dict,
         raise ValueError(f"unknown vel_loss {vel_loss!r}")
     mem, n_views = denoiser.encode_tokens(tokens)
     x_1 = pack_sq(tgt, t_mean=denoiser.t_mean, t_std=denoiser.t_std,
-                  shift=denoiser.flow_shift, scale=denoiser.flow_scale)
+                  shift=denoiser.flow_shift, scale=denoiser.flow_scale, deform=denoiser.deform)
     m = tgt["exist"]
     if repeat > 1:
         mem = mem.repeat_interleave(repeat, dim=0)
@@ -228,12 +270,13 @@ def flow_loss(denoiser: FlowSQDenoiser, tokens: torch.Tensor, tgt: dict,
     v_pred = denoiser(x_t, t, mem=mem, n_views=n_views)
     err2 = (v_pred - (x_1 - x_0)) ** 2
     n = m.sum().clamp_min(1.0)
+    slices = DEFORM_GROUP_SLICES if denoiser.deform else GROUP_SLICES
     if vel_loss == "l2":
         parts = {k: (torch.sqrt(err2[..., sl].sum(dim=-1) + 1e-8) * m).sum() / n
-                 for k, sl in GROUP_SLICES.items() if k != "exist"}
+                 for k, sl in slices.items() if k != "exist"}
         parts["exist"] = torch.sqrt(err2[..., 14:15].sum(dim=-1) + 1e-8).mean()
     else:
-        parts = {k: (err2[..., sl].mean(-1) * m).sum() / n for k, sl in GROUP_SLICES.items() if k != "exist"}
+        parts = {k: (err2[..., sl].mean(-1) * m).sum() / n for k, sl in slices.items() if k != "exist"}
         parts["exist"] = err2[..., 14].mean()
     v_loss = sum(parts.values())
     if mode == "velocity":
@@ -243,7 +286,7 @@ def flow_loss(denoiser: FlowSQDenoiser, tokens: torch.Tensor, tgt: dict,
     x1_hat = x_t + (1.0 - t[:, None, None]) * v_pred
     pred_sq = decode_sq(x1_hat, normalized=True, smooth_exist=True,
                         t_mean=denoiser.t_mean, t_std=denoiser.t_std,
-                        shift=denoiser.flow_shift, scale=denoiser.flow_scale)
+                        shift=denoiser.flow_shift, scale=denoiser.flow_scale, deform=denoiser.deform)
     wt = t[:, None]
     rep = (lambda a: a.repeat_interleave(repeat, dim=0)) if repeat > 1 else (lambda a: a)
     x1_masked = lambda a, b: ((((a - b) ** 2).flatten(2).mean(-1) * wt) * m).sum() / n
@@ -254,9 +297,21 @@ def flow_loss(denoiser: FlowSQDenoiser, tokens: torch.Tensor, tgt: dict,
         + x1_masked(pred_sq["eps"], rep(tgt["eps"]))
         + (F.binary_cross_entropy_with_logits(pred_sq["exist_logit"], m, reduction="none") * wt).mean()
     )
+    extra_x1: dict[str, float] = {}
+    if denoiser.deform:
+        bend_tgt = rep(tgt["bend"])
+        bend_logit_tgt = torch.logit(bend_tgt.clamp(1e-4, 1.0 - 1e-4))
+        bend_logit_pred = torch.logit(pred_sq["bend"].clamp(1e-4, 1.0 - 1e-4))
+        tvec = torch.stack([rep(tgt["alpha"]).sin(), rep(tgt["alpha"]).cos()], -1)
+        x1_taper = x1_masked(pred_sq["taper"], rep(tgt["taper"]))
+        x1_bend = x1_masked(bend_logit_pred, bend_logit_tgt)
+        d2_alpha = ((pred_sq["alpha_vec"] - tvec) ** 2).sum(-1) * bend_tgt
+        x1_alpha = ((d2_alpha.mean(-1) * wt) * m).sum() / n
+        x1_loss = x1_loss + x1_taper + x1_bend + x1_alpha
+        extra_x1 = {"x1_taper": x1_taper.item(), "x1_bend": x1_bend.item(), "x1_alpha": x1_alpha.item()}
     total = v_loss + w_x1 * x1_loss
     out = {k: v.item() for k, v in parts.items()}
-    out.update(v_loss=v_loss.item(), x1_loss=x1_loss.item())
+    out.update(v_loss=v_loss.item(), x1_loss=x1_loss.item(), **extra_x1)
     return total, out
 
 
@@ -266,7 +321,7 @@ def sample_euler(denoiser: FlowSQDenoiser, tokens: torch.Tensor, n_queries: int 
                  n_steps: int = 20, generator: torch.Generator | None = None) -> torch.Tensor:
     """Integrate CondOT ODE from t=0 (N(0,1)) to t=1 using n_steps Euler steps."""
     mem, n_views = denoiser.encode_tokens(tokens)
-    x = torch.randn((tokens.shape[0], n_queries, SQ_DIM), device=tokens.device, dtype=tokens.dtype, generator=generator)
+    x = torch.randn((tokens.shape[0], n_queries, denoiser.sq_dim), device=tokens.device, dtype=tokens.dtype, generator=generator)
     dt = 1.0 / n_steps
     for k in range(n_steps):
         t = torch.full((tokens.shape[0],), k * dt, device=tokens.device, dtype=tokens.dtype)
