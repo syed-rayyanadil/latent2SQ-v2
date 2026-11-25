@@ -165,7 +165,11 @@ def evaluate(vggt, dec, pool, samples_by_n, P, batch, device, cfg: dict, geom: G
                 pred = decode_sq(sample_euler(dec, tokens, n_queries=P, n_steps=cfg.get("flow_steps", 20), generator=gen),
                                  t_mean=dec.t_mean, t_std=dec.t_std, shift=dec.flow_shift, scale=dec.flow_scale,
                                  deform=dec.deform)
-                loss, _ = flow_loss(dec, tokens, tgt, generator=gen, vel_loss=cfg.get("flow_vel_loss", "mse"))
+                geo_mode = cfg.get("flow_geo", "none")
+                eval_mode = cfg.get("flow_loss", "velocity") if geo_mode != "none" else "velocity"
+                loss, _ = flow_loss(dec, tokens, tgt, generator=gen, mode=eval_mode,
+                                    w_x1=cfg.get("w_x1", 1.0), vel_loss=cfg.get("flow_vel_loss", "mse"),
+                                    geo_loss=geo_mode, w_geo=cfg.get("w_geo", 1.0))
             else:
                 pred = dec(tokens)
                 loss, _ = compute_loss(pred, tgt, cfg)
@@ -277,6 +281,9 @@ def main(argv: list[str] | None = None) -> None:
                    help="flow velocity loss per SQ parameter group: mse or Euclidean norm (l2)")
     p.add_argument("--flow-deform", action="store_true",
                    help="deformable 26-dim SQs for --decoder flow (pass gt_sq_deform.npz to --gt-sq)")
+    p.add_argument("--flow-geo", choices=["none", "points", "chamfer"], default="none",
+                   help="t-weighted shape loss on x1_hat in --flow-loss mix (default none)")
+    p.add_argument("--w-geo", type=float, default=1.0, help="weight of --flow-geo loss")
     # optimization
     p.add_argument("--steps", type=int, default=3000)
     p.add_argument("--batch", type=int, default=2, help="samples per step (each N views)")
@@ -354,9 +361,13 @@ def main(argv: list[str] | None = None) -> None:
     a.exist_mode = loss_config(vars(a))["exist_mode"]     # store the resolved default with the run
     (out / "args.json").write_text(json.dumps(vars(a), indent=2))
     cfg = {**loss_config(vars(a)), "n_surf": a.n_surf, "n_vol": a.n_vol,
-           "decoder": a.decoder, "flow_steps": a.flow_steps, "flow_vel_loss": a.flow_vel_loss}
+           "decoder": a.decoder, "flow_steps": a.flow_steps, "flow_loss": a.flow_loss,
+           "w_x1": a.w_x1, "flow_vel_loss": a.flow_vel_loss,
+           "flow_geo": a.flow_geo, "w_geo": a.w_geo}
     if a.decoder == "flow" and a.deform:
         sys.exit("--decoder flow does not take --deform (use --flow-deform with --gt-sq gt_sq_deform.npz).")
+    if a.flow_geo != "none" and a.decoder == "flow" and a.flow_loss != "mix":
+        sys.exit("--flow-geo requires --flow-loss mix.")
     use_deform = a.flow_deform if a.decoder == "flow" else a.deform
 
     print("loading views and pseudo-GT ...", file=sys.stderr)
@@ -481,7 +492,8 @@ def main(argv: list[str] | None = None) -> None:
         t_vggt += td0 - tv0
         if a.decoder == "flow":
             loss, parts = flow_loss(dec, tokens, tgt, repeat=a.flow_repeat, mode=a.flow_loss,
-                                    w_x1=a.w_x1, vel_loss=a.flow_vel_loss)
+                                    w_x1=a.w_x1, vel_loss=a.flow_vel_loss,
+                                    geo_loss=a.flow_geo, w_geo=a.w_geo)
         else:
             pred = dec(tokens)
             if a.deform and step <= a.deform_start:      # rigid phase: deformation outputs get no gradient

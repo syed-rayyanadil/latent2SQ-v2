@@ -178,13 +178,15 @@ def test_train_py_flow_wiring() -> None:
             "--train", "fake_train", "--test", "fake_test", "--gt-sq", "fake_deform.npz",
             "--out", str(out_def), "--decoder", "flow", "--flow-deform", "--flow-norm-all",
             "--flow-loss", "mix", "--flow-vel-loss", "l2", "--flow-slot-sinus", "--flow-fourier", "2",
+            "--flow-geo", "points", "--w-geo", "0.5",
             "--layers", "1", "--d-model", "64", "--heads", "4", "--ffn", "128",
             "--steps", "1", "--log-every", "1", "--eval-every", "1", "--eval-per-n", "1",
             "--examples", "1", "--batch", "2", "--n-surf", "64", "--n-vol", "64",
             "--flow-steps", "4", "--device", "cpu", "--no-tb",
         ])
         args_def = json.loads((out_def / "args.json").read_text())
-        assert args_def["flow_deform"] is True and args_def["flow_fourier"] == 2 and args_def["flow_vel_loss"] == "l2"
+        assert (args_def["flow_deform"] is True and args_def["flow_fourier"] == 2
+                and args_def["flow_vel_loss"] == "l2" and args_def["flow_geo"] == "points" and args_def["w_geo"] == 0.5)
         final_def = json.loads((out_def / "eval_final.json").read_text())
         assert "taper_err" in final_def["test"]["all"] and "bend_err" in final_def["test"]["all"]
         ckpt_def = torch.load(out_def / "decoder.pt", map_location="cpu", weights_only=False)
@@ -539,6 +541,76 @@ def test_flow_deform() -> None:
         assert len(grads) > 0 and all(torch.isfinite(gr).all() for gr in grads)
 
 
+def test_flow_geo_loss() -> None:
+    from l2sq.flow_matching_decoder import _geo_surface_loss
+
+    torch.manual_seed(0)
+    B, P, M = 2, 8, 4
+    tgt = _fake_tgt(B, P, M, seed=31)
+    tgt["s"] = torch.tensor([1.5, 2.0])
+    tgt["surf"] = torch.randn(B, 128, 3) * 0.2
+    tokens = torch.randn(B, 2, 8, TOKEN_DIM)
+
+    # 1. points geo loss: 0 when pred == tgt, strictly positive when rotated 20 deg or shifted
+    m = tgt["exist"]
+    n = m.sum().clamp_min(1.0)
+    wt = torch.ones(B, 1)
+    rep = lambda a: a
+    # Make slot 0 an elongated thin rod so 20-deg rotation clearly moves surface points
+    tgt_rod = {k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in tgt.items()}
+    tgt_rod["scale"][:, 0] = torch.tensor([0.3, 0.02, 0.02])
+    tgt_rod["R"][:, 0] = torch.eye(3)
+
+    g_zero = _geo_surface_loss(tgt_rod, tgt_rod, wt, m, n, rep, False, "points", 1)
+    assert g_zero.item() == 0.0
+
+    ang = np.deg2rad(20.0)
+    Rz = torch.tensor([[np.cos(ang), -np.sin(ang), 0.0],
+                       [np.sin(ang),  np.cos(ang), 0.0],
+                       [0.0,          0.0,         1.0]], dtype=torch.float32)
+    pred_rot = {k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in tgt_rod.items()}
+    pred_rot["R"][0, 0] = Rz @ pred_rot["R"][0, 0]
+    g_rot = _geo_surface_loss(pred_rot, tgt_rod, wt, m, n, rep, False, "points", 1)
+    assert g_rot.item() > 1e-4, f"expected rotation loss > 0, got {g_rot.item()}"
+
+    pred_shift = {k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in tgt_rod.items()}
+    pred_shift["t"][0, 0, 0] += 0.1
+    g_shift = _geo_surface_loss(pred_shift, tgt_rod, wt, m, n, rep, False, "points", 1)
+    assert g_shift.item() > 1e-4, f"expected shift loss > 0, got {g_shift.item()}"
+
+    # 2. Direct rot6d -> decode_sq -> _geo_surface_loss gradient check
+    x_raw = pack_sq(tgt_rod, normalize=True, deform=False).requires_grad_(True)
+    dec_x = decode_sq(x_raw, normalized=True, smooth_exist=True)
+    g_diff = _geo_surface_loss(dec_x, pred_rot, wt, m, n, rep, False, "points", 1)
+    g_diff.backward()
+    assert x_raw.grad is not None and torch.isfinite(x_raw.grad).all()
+    assert x_raw.grad[:, :M, 3:9].abs().sum() > 0    # rot6d gets gradient
+    assert x_raw.grad[:, :M, 0:3].abs().sum() > 0    # t gets gradient
+
+    # 3. flow_loss with geo_loss in ("points", "chamfer"), both rigid and deform + all flags
+    for deform in (False, True):
+        t_cur = {k: (v.clone() if isinstance(v, torch.Tensor) else v) for k, v in tgt.items()}
+        if deform:
+            t_cur["taper"] = torch.zeros(B, P, 2) + 0.1
+            t_cur["bend"] = torch.zeros(B, P, 3) + 0.2
+            t_cur["alpha"] = torch.zeros(B, P, 3) + 0.4
+        den = FlowSQDenoiser(d_model=64, n_queries=P, n_layers=1, n_heads=4, ffn_dim=128,
+                             slot_init="sinus", fourier_freqs=2, deform=deform)
+        # Default geo_loss="none" keeps parts without "geo"
+        l_none, p_none = flow_loss(den, tokens, t_cur, generator=torch.Generator().manual_seed(55),
+                                   mode="mix", w_x1=1.0, vel_loss="l2")
+        assert "geo" not in p_none and torch.isfinite(l_none)
+
+        for geo_mode in ("points", "chamfer"):
+            den.zero_grad()
+            loss, parts = flow_loss(den, tokens, t_cur, generator=torch.Generator().manual_seed(55),
+                                    mode="mix", w_x1=1.0, vel_loss="l2", geo_loss=geo_mode, w_geo=0.5)
+            assert "geo" in parts and np.isfinite(parts["geo"]) and torch.isfinite(loss)
+            loss.backward()
+            grads = [p.grad for p in den.parameters() if p.grad is not None]
+            assert len(grads) > 0 and all(torch.isfinite(gr).all() for gr in grads)
+
+
 if __name__ == "__main__":
     test_overfit_one_batch()
     test_flow_repeat()
@@ -548,5 +620,6 @@ if __name__ == "__main__":
     test_slot_init_sinus()
     test_fourier_and_l2_vel_loss()
     test_flow_deform()
+    test_flow_geo_loss()
     test_train_py_flow_wiring()
     print("\nALL CPU FLOW TESTS PASSED")

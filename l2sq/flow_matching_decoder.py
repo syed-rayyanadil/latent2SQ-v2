@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from l2sq.model import TOKEN_DIM, sinusoidal
-from l2sq.sq import EPS_MAX, EPS_MIN, SCALE_MIN, rot6d_to_matrix
+from l2sq.sq import EPS_MAX, EPS_MIN, SCALE_MIN, chamfer, rot6d_to_matrix, sample_surface, sample_surface_uniform
 
 SQ_DIM = 15  # rigid: t(3), rot6d(6), log_scale(3), eps_raw(2), exist(1)
 DEFORM_DIM = 26  # + taper(2), bend_logit(3), alpha_cs(6)
@@ -245,10 +245,56 @@ class FlowSQDenoiser(nn.Module):
         return self.out_proj(self.out_norm(x)) + self.t_scale(cond).unsqueeze(1) * self.x_skip(x_t)
 
 
+def _geo_surface_loss(
+    pred_sq: dict, tgt: dict, wt: torch.Tensor, m: torch.Tensor, n: torch.Tensor,
+    rep, deform: bool, geo_loss: str, repeat: int,
+    n_geo_points: int = 128, generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """t-weighted surface geometry loss on one-step clean estimates x1_hat ('points' or 'chamfer')."""
+    if geo_loss == "points":
+        # Fixed deterministic 8x16 = 128-point (eta, omega) grid per SQ; preserves slot & point correspondence.
+        deform_p = (pred_sq["taper"], pred_sq["bend"], pred_sq["alpha"]) if deform else (None, None, None)
+        p_pts = sample_surface(pred_sq["scale"], pred_sq["eps"], pred_sq["R"], pred_sq["t"],
+                               8, 16, *deform_p)                                            # (B,P,128,3)
+        with torch.no_grad():
+            deform_g = (rep(tgt["taper"]), rep(tgt["bend"]), rep(tgt["alpha"])) if deform else (None, None, None)
+            g_pts = sample_surface(rep(tgt["scale"]), rep(tgt["eps"]), rep(tgt["R"]), rep(tgt["t"]),
+                                   8, 16, *deform_g)                                        # (B,P,128,3)
+        d_slot = ((p_pts - g_pts) ** 2).sum(dim=-1).mean(dim=-1)                           # (B,P)
+        return ((d_slot * wt) * m).sum() / n
+
+    if geo_loss == "chamfer":
+        deform_p = (pred_sq["taper"], pred_sq["bend"], pred_sq["alpha"]) if deform else (None, None, None)
+        p_all = sample_surface_uniform(pred_sq["scale"], pred_sq["eps"], pred_sq["R"], pred_sq["t"],
+                                       n_geo_points, *deform_p, generator=generator)        # (B,P,S,3)
+        has_surf = "surf" in tgt
+        if has_surf:
+            g_surf = rep(tgt["surf"])
+        else:
+            with torch.no_grad():
+                deform_g = (rep(tgt["taper"]), rep(tgt["bend"]), rep(tgt["alpha"])) if deform else (None, None, None)
+                g_all = sample_surface_uniform(rep(tgt["scale"]), rep(tgt["eps"]), rep(tgt["R"]), rep(tgt["t"]),
+                                               n_geo_points, *deform_g, generator=generator)
+        s_vec = rep(tgt["s"]) if "s" in tgt else None
+        losses = []
+        for b in range(p_all.shape[0]):
+            mb = m[b] > 0.5
+            if not mb.any():
+                continue
+            p_b = p_all[b, mb].reshape(-1, 3)
+            g_b = g_surf[b] if has_surf else g_all[b, mb].reshape(-1, 3)
+            sb = s_vec[b] if s_vec is not None else 1.0
+            losses.append(wt[b, 0] * chamfer(p_b, g_b) * sb)
+        return torch.stack(losses).mean() if losses else p_all.sum() * 0.0
+
+    raise ValueError(f"unknown geo_loss {geo_loss!r}")
+
+
 def flow_loss(denoiser: FlowSQDenoiser, tokens: torch.Tensor, tgt: dict,
               generator: torch.Generator | None = None, repeat: int = 1,
               mode: str = "velocity", w_x1: float = 1.0,
-              vel_loss: str = "mse") -> tuple[torch.Tensor, dict]:
+              vel_loss: str = "mse", geo_loss: str = "none",
+              w_geo: float = 1.0, n_geo_points: int = 128) -> tuple[torch.Tensor, dict]:
     """CondOT velocity loss ('mse' or Euclidean 'l2'), optionally mixed with t-weighted decoded x1_hat MSE + BCE."""
     if repeat < 1:
         raise ValueError(f"repeat must be >= 1, got {repeat}")
@@ -256,6 +302,8 @@ def flow_loss(denoiser: FlowSQDenoiser, tokens: torch.Tensor, tgt: dict,
         raise ValueError(f"unknown flow loss mode {mode!r}")
     if vel_loss not in ("mse", "l2"):
         raise ValueError(f"unknown vel_loss {vel_loss!r}")
+    if geo_loss not in ("none", "points", "chamfer"):
+        raise ValueError(f"unknown geo_loss {geo_loss!r}")
     mem, n_views = denoiser.encode_tokens(tokens)
     x_1 = pack_sq(tgt, t_mean=denoiser.t_mean, t_std=denoiser.t_std,
                   shift=denoiser.flow_shift, scale=denoiser.flow_scale, deform=denoiser.deform)
@@ -310,6 +358,11 @@ def flow_loss(denoiser: FlowSQDenoiser, tokens: torch.Tensor, tgt: dict,
         x1_loss = x1_loss + x1_taper + x1_bend + x1_alpha
         extra_x1 = {"x1_taper": x1_taper.item(), "x1_bend": x1_bend.item(), "x1_alpha": x1_alpha.item()}
     total = v_loss + w_x1 * x1_loss
+    if geo_loss != "none":
+        geo = _geo_surface_loss(pred_sq, tgt, wt, m, n, rep, denoiser.deform, geo_loss, repeat,
+                                n_geo_points=n_geo_points, generator=generator)
+        total = total + w_geo * geo
+        extra_x1["geo"] = geo.item()
     out = {k: v.item() for k, v in parts.items()}
     out.update(v_loss=v_loss.item(), x1_loss=x1_loss.item(), **extra_x1)
     return total, out
