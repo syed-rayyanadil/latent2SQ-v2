@@ -208,6 +208,13 @@ def evaluate(vggt, dec, pool, samples_by_n, P, batch, device, cfg: dict, geom: G
     return out
 
 
+def export_sq_ply(d: dict, b: int, sel: torch.Tensor, s: float, path: Path) -> None:
+    """Export selected superquadrics of batch item `b` (scaled to world units by `s`) as a .ply mesh."""
+    d_cpu = {k: (v.detach().cpu() if isinstance(v, torch.Tensor) else v) for k, v in d.items()}
+    sc, ep, R, t, _, _, ta, be, al = sq_args(d_cpu, b, sel.detach().cpu(), s)
+    sq_mesh(sc, ep, R, t, taper=ta, bend=be, alpha=al).export(path)
+
+
 @torch.no_grad()
 def export_examples(vggt, dec, pool, samples, split, P, device, folder: Path,
                     decoder: str = "parallel", flow_steps: int = 20):
@@ -231,8 +238,7 @@ def export_examples(vggt, dec, pool, samples, split, P, device, folder: Path,
         gt_slots = tgt["exist"][0] > 0.5
         # metric (world units) in the reference camera's frame -> recon.view starts at this camera
         for name, d_, sel in [("gt_sq.ply", tgt, gt_slots), ("pred_sq.ply", pred, keep)]:
-            sc, ep, R, t, _, _, ta, be, al = sq_args(d_, 0, sel, s)
-            sq_mesh(sc, ep, R, t, taper=ta, bend=be, alpha=al).export(d / name)
+            export_sq_ply(d_, 0, sel, s, d / name)
         (d / "sample.json").write_text(json.dumps({
             "split": split, "views": smp.views, "images": [f"images/{v:03d}.png" for v in smp.views],
             "pool": str(pool.folder), "s": s, "n_pred": int(keep.sum()), "deform": dec.deform}, indent=2))

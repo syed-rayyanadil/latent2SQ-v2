@@ -12,18 +12,20 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import sys
 from pathlib import Path
 
 import numpy as np
 import torch
+from PIL import Image
 
 from l2sq.data import GeomTargets, GTSuperquadrics, ViewPool, apply_box_occlusion, collate
 from l2sq.flow_matching_decoder import FlowSQDenoiser, decode_sq, sample_euler
 from l2sq.geom_loss import occupancy_iou
 from l2sq.model import FrozenVGGT, SQDecoder
 from l2sq.sq import chamfer, geodesic_deg, to_view_frame
-from l2sq.train import _nanmean, eval_samples, even_points
+from l2sq.train import _nanmean, eval_samples, even_points, export_sq_ply
 
 EVAL_NS = (1, 4, 8)
 BOX_PS = (0.0, 0.25, 0.5, 0.75)
@@ -225,9 +227,91 @@ def _pairwise_chamfer_world(pts_k: list[torch.Tensor | None], scale_s: float) ->
     return float(np.mean(dists))
 
 
+def _tensor_to_pil(img_chw: torch.Tensor) -> Image.Image:
+    """Convert a (3, H, W) float tensor in [0, 1] (RGB) to an 8-bit PIL Image."""
+    arr = (img_chw.detach().cpu().clamp(0.0, 1.0) * 255.0).round().to(torch.uint8).permute(1, 2, 0).numpy()
+    return Image.fromarray(arr, mode="RGB")
+
+
+def _save_occlusion_images(out_dir: Path, clean_imgs: torch.Tensor, occ_imgs: torch.Tensor) -> None:
+    """Save clean/occluded per-view PNGs and a 2-row comparison sheet side by side."""
+    N, _, H, W = clean_imgs.shape
+    compare = Image.new("RGB", (N * W, 2 * H))
+    for v in range(N):
+        c_pil = _tensor_to_pil(clean_imgs[v])
+        o_pil = _tensor_to_pil(occ_imgs[v])
+        c_pil.save(out_dir / f"input_clean_{v}.png")
+        o_pil.save(out_dir / f"input_occluded_{v}.png")
+        compare.paste(c_pil, (v * W, 0))
+        compare.paste(o_pil, (v * W, H))
+    compare.save(out_dir / "input_compare.png")
+
+
+def _export_sample_bundle(
+    sample_dir: Path,
+    model_label: str,
+    setting: str,
+    mode: str,
+    p_val: float,
+    side: str | None,
+    n_views: int,
+    sample_idx: int,
+    smp,
+    mask_seed: int,
+    clean_imgs: torch.Tensor,
+    occ_imgs: torch.Tensor,
+    tgt: dict,
+    b: int,
+    draws: list[tuple[int, dict, dict]],
+) -> None:
+    """Save clean/occluded images, comparison sheet, GT/predicted SQ .ply meshes, and sample.json."""
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    _save_occlusion_images(sample_dir, clean_imgs, occ_imgs)
+    s_val = float(smp.scale_s)
+    gt_slots = tgt["exist"][b] > 0.5
+    export_sq_ply(tgt, b, gt_slots, s_val, sample_dir / "gt_sq.ply")
+
+    draw_records = []
+    for draw_idx, pred_j, metrics_j in draws:
+        exist_mask = torch.sigmoid(pred_j["exist_logit"][b]) > 0.5
+        n_pred_j = int(exist_mask.sum())
+        keep = exist_mask.clone()
+        if not keep.any():
+            keep[:] = True
+        ply_name = f"pred_sq_draw{draw_idx}.ply"
+        export_sq_ply(pred_j, b, keep, s_val, sample_dir / ply_name)
+        draw_records.append({
+            "draw": draw_idx,
+            "ply": ply_name,
+            "n_pred": n_pred_j,
+            "rot_deg": float(metrics_j["rot_deg"]),
+            "t_err_world": float(metrics_j["t_err_world"]),
+            "scale_rel_err": float(metrics_j["scale_rel_err"]),
+            "chamfer_world": float(metrics_j["chamfer_world"]),
+            "chamfer_gt": float(metrics_j["chamfer_gt"]),
+            "iou": float(metrics_j["iou"]),
+            "exist_acc": float(metrics_j["exist_acc"]),
+        })
+
+    (sample_dir / "sample.json").write_text(json.dumps({
+        "model": model_label,
+        "setting": setting,
+        "mode": mode,
+        "p": p_val,
+        "side": side,
+        "N": n_views,
+        "sample_idx": sample_idx,
+        "views": list(smp.views),
+        "mask_seed": mask_seed,
+        "scale_s": s_val,
+        "n_pred": [d["n_pred"] for d in draw_records],
+        "draws": draw_records,
+    }, indent=2))
+
+
 @torch.no_grad()
 def _eval_batches(
-    batch_items: list[tuple[dict, dict, dict[str, dict]]],
+    batch_items: list[tuple[dict, dict, dict[str, dict], list]],
     occlude_fn,
     vggt: torch.nn.Module,
     dec_parallel: SQDecoder,
@@ -237,6 +321,7 @@ def _eval_batches(
     k_samples: int,
     seed: int,
     device: str,
+    export_ctx: dict | None = None,
 ) -> dict:
     par_acc = {k: [] for k in METRIC_KEYS}
     par_acc["n_empty"] = 0
@@ -244,9 +329,15 @@ def _eval_batches(
     surf_gen_p = torch.Generator(device=device).manual_seed(seed)
     surf_gen_f = {name: torch.Generator(device=device).manual_seed(seed) for name in flow_models}
 
-    for base_tgt, par_tgt, flow_tgts in batch_items:
+    sample_offset = 0
+    for base_tgt, par_tgt, flow_tgts, chunk in batch_items:
         masked_imgs = occlude_fn(base_tgt["images"])
         tokens = vggt(masked_imgs)
+        B = base_tgt["images"].shape[0]
+        exp_indices = (
+            [b for b in range(B) if sample_offset + b < export_ctx["n_samples"]]
+            if export_ctx is not None else []
+        )
 
         # 1. Parallel baseline (single deterministic forward pass)
         pred_p = dec_parallel(tokens)
@@ -254,6 +345,15 @@ def _eval_batches(
         for k in METRIC_KEYS:
             par_acc[k].extend(m_p[k])
         par_acc["n_empty"] += sum(1 for v in m_p["chamfer_world"] if not np.isfinite(v))
+        for b in exp_indices:
+            s_idx = sample_offset + b
+            m_b = {k: m_p[k][b] for k in METRIC_KEYS}
+            _export_sample_bundle(
+                export_ctx["root"] / "parallel" / f"{export_ctx['setting']}_N{export_ctx['N']}_{s_idx}",
+                "parallel", export_ctx["setting"], export_ctx["mode"], export_ctx["p"], export_ctx["side"],
+                export_ctx["N"], s_idx, chunk[b], export_ctx["mask_seed"],
+                base_tgt["images"][b], masked_imgs[b], par_tgt, b, [(0, pred_p, m_b)],
+            )
 
         # 2. Flow models (K Euler draws on the exact same VGGT tokens)
         for name, dec_flow in flow_models.items():
@@ -263,6 +363,8 @@ def _eval_batches(
             draw_metrics = []
             draw_pts: list[list[torch.Tensor | None]] = []
             draw_t_world = []
+            saved_preds: dict[int, dict] = {}
+            n_export_draws = export_ctx["n_draws"] if exp_indices else 0
             s = tgt_m["s"][:, None, None]
             for kk in range(k_samples):
                 x_k = sample_euler(dec_flow, tokens, n_queries=P, n_steps=n_steps, generator=noise_gens[kk])
@@ -276,10 +378,26 @@ def _eval_batches(
                 draw_metrics.append(m_k)
                 draw_pts.append(pts_k)
                 draw_t_world.append(pred_k["t"] * s)
+                if exp_indices and kk < n_export_draws:
+                    saved_preds[kk] = {kp: vp.detach().cpu() for kp, vp in pred_k.items()}
+
+            extra_draws: list[tuple[int, dict, dict]] = []
+            if exp_indices and n_export_draws > k_samples:
+                extra_surf_gen = torch.Generator(device=device).manual_seed(seed + 10000)
+                for kk in range(k_samples, n_export_draws):
+                    g_extra = torch.Generator(device=device).manual_seed(seed + kk)
+                    x_k = sample_euler(dec_flow, tokens, n_queries=P, n_steps=n_steps, generator=g_extra)
+                    pred_k = decode_sq(
+                        x_k,
+                        t_mean=dec_flow.t_mean, t_std=dec_flow.t_std,
+                        shift=dec_flow.flow_shift, scale=dec_flow.flow_scale,
+                        deform=dec_flow.deform,
+                    )
+                    m_k, _ = _per_sample_metrics(pred_k, tgt_m, extra_surf_gen)
+                    extra_draws.append((kk, {kp: vp.detach().cpu() for kp, vp in pred_k.items()}, m_k))
 
             t_stack = torch.stack(draw_t_world, dim=0)   # (K, B, P, 3)
             gt_mask = tgt_m["exist"] > 0.5
-            B = gt_mask.shape[0]
             acc = flow_acc[name]
             for b in range(B):
                 if any(np.isfinite(draw_metrics[kk]["chamfer_world"][b]) for kk in range(k_samples)):
@@ -299,6 +417,23 @@ def _eval_batches(
                                                                      float(tgt_m["s"][b])))
                 spread_b = float(t_stack[:, b, gt_mask[b], :].std(dim=0, unbiased=False).norm(dim=-1).mean())
                 acc["t_spread"].append(spread_b)
+
+            for b in exp_indices:
+                s_idx = sample_offset + b
+                draws_b = [
+                    (kk, saved_preds[kk], {k: draw_metrics[kk][k][b] for k in METRIC_KEYS})
+                    for kk in range(min(n_export_draws, k_samples))
+                ] + [
+                    (kk, pk, {k: mk[k][b] for k in METRIC_KEYS})
+                    for kk, pk, mk in extra_draws
+                ]
+                _export_sample_bundle(
+                    export_ctx["root"] / name / f"{export_ctx['setting']}_N{export_ctx['N']}_{s_idx}",
+                    name, export_ctx["setting"], export_ctx["mode"], export_ctx["p"], export_ctx["side"],
+                    export_ctx["N"], s_idx, chunk[b], export_ctx["mask_seed"],
+                    base_tgt["images"][b], masked_imgs[b], tgt_m, b, draws_b,
+                )
+        sample_offset += B
 
     return _summarize_bucket(par_acc, flow_acc)
 
@@ -378,6 +513,12 @@ def evaluate_occlusion(
     parallel_gt: GTSuperquadrics | None = None,
     flow_gts: dict[str, GTSuperquadrics] | None = None,
     flow_steps_by_model: dict[str, int] | None = None,
+    export_dir: str | Path | None = None,
+    export_p: tuple[float, ...] | list[float] = (0.5,),
+    export_halves: bool = False,
+    export_n: tuple[int, ...] | list[int] = (1, 4),
+    export_samples: int = 3,
+    export_draws: int = 3,
 ) -> list[dict]:
     """Run box and half occlusion sweeps and return/save all CSV rows."""
     if flow_models is None:
@@ -389,9 +530,12 @@ def evaluate_occlusion(
     f_steps = flow_steps_by_model if flow_steps_by_model is not None else {name: flow_steps for name in flow_models}
     base_gt = par_gt if par_gt is not None else next(iter(f_gts.values()))
 
+    export_root = Path(export_dir) if export_dir is not None else None
+    export_n_set = set(export_n)
+
     samples_by_n = eval_samples(test_pool, base_gt, EVAL_NS, per_n, seed)
     rng_geom = np.random.default_rng(seed)
-    batches_by_n: dict[int, list[tuple[dict, dict, dict[str, dict]]]] = {}
+    batches_by_n: dict[int, list[tuple[dict, dict, dict[str, dict], list]]] = {}
     for n in EVAL_NS:
         smps = samples_by_n[n]
         items = []
@@ -403,7 +547,7 @@ def evaluate_occlusion(
                 name: (base_tgt if f_gts[name] is base_gt else _retarget_batch(base_tgt, test_pool, chunk, f_gts[name], P, device))
                 for name in flow_models
             }
-            items.append((base_tgt, par_tgt, model_tgts))
+            items.append((base_tgt, par_tgt, model_tgts, chunk))
         batches_by_n[n] = items
 
     csv_rows: list[dict] = []
@@ -414,10 +558,17 @@ def evaluate_occlusion(
         per_n_res = {}
         for n in EVAL_NS:
             mask_rng = np.random.default_rng(mask_seed)
+            export_ctx = None
+            if export_root is not None and n in export_n_set and any(abs(p - ep) < 1e-6 for ep in export_p):
+                export_ctx = {
+                    "root": export_root, "setting": f"p{p:g}", "mode": "box", "p": float(p), "side": None,
+                    "N": n, "n_samples": export_samples, "n_draws": export_draws, "mask_seed": mask_seed,
+                }
             res = _eval_batches(
                 batches_by_n[n],
                 lambda imgs, _p=p, _r=mask_rng: apply_box_occlusion(imgs, _p, _r),
                 vggt, dec_parallel, flow_models, f_steps, P, k_samples, seed, device,
+                export_ctx=export_ctx,
             )
             per_n_res[n] = res
             box_table_rows.append((f"{p:.2f}", str(n), res))
@@ -434,10 +585,17 @@ def evaluate_occlusion(
     for side in HALF_SIDES:
         per_n_res = {}
         for n in EVAL_NS:
+            export_ctx = None
+            if export_root is not None and export_halves and n in export_n_set:
+                export_ctx = {
+                    "root": export_root, "setting": f"half_{side}", "mode": "half", "p": 0.5, "side": side,
+                    "N": n, "n_samples": export_samples, "n_draws": export_draws, "mask_seed": mask_seed,
+                }
             res = _eval_batches(
                 batches_by_n[n],
                 lambda imgs, _s=side: apply_half_occlusion(imgs, _s),
                 vggt, dec_parallel, flow_models, f_steps, P, k_samples, seed, device,
+                export_ctx=export_ctx,
             )
             per_n_res[n] = res
             side_res_by_n[n].append(res)
@@ -500,6 +658,12 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--seed", type=int, default=1234, help="seed for fixed test batches, surface samples, and flow noise")
     p.add_argument("--mask-seed", type=int, default=1234, help="seed for random occlusion boxes")
     p.add_argument("--out", default="runs/occlusion_eval/results.csv", help="output CSV path")
+    p.add_argument("--export-dir", default=None, help="export occluded images and SQ .ply meshes here (default None = off)")
+    p.add_argument("--export-p", nargs="+", type=float, default=[0.5], help="box area fractions to export (default 0.5)")
+    p.add_argument("--export-halves", action="store_true", help="also export the 4 half occlusions (default off)")
+    p.add_argument("--export-n", nargs="+", type=int, default=[1, 4], help="view counts N to export (default 1 4)")
+    p.add_argument("--export-samples", type=int, default=3, help="number of test samples per N and setting to export (default 3)")
+    p.add_argument("--export-draws", type=int, default=3, help="number of flow draws to save per input (default 3)")
     p.add_argument("--device", default="cuda")
     a = p.parse_args(argv)
 
@@ -584,6 +748,8 @@ def main(argv: list[str] | None = None) -> None:
         k_samples=a.k, seed=a.seed, mask_seed=a.mask_seed, device=a.device,
         flow_models=flow_models, parallel_gt=parallel_gt, flow_gts=flow_gts,
         flow_steps_by_model=flow_steps_by_model,
+        export_dir=a.export_dir, export_p=a.export_p, export_halves=a.export_halves,
+        export_n=a.export_n, export_samples=a.export_samples, export_draws=a.export_draws,
     )
 
 

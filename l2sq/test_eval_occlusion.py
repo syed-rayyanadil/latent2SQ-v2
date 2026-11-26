@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import csv
+import json
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
 import torch
+from PIL import Image
 
 from l2sq.data import augment_occlusion
 from l2sq.eval_occlusion import (
@@ -242,9 +244,124 @@ def test_augment_occlusion() -> None:
     assert (fracs >= 0.23).all() and (fracs <= 0.77).all(), f"unexpected box fracs: {fracs}"
 
 
+def test_occlusion_export() -> None:
+    import l2sq.eval_occlusion as eo_mod
+    import l2sq.train as train_mod
+
+    class FakeMesh:
+        def __init__(self, n_sq: int) -> None:
+            self.n_sq = n_sq
+
+        def export(self, path: Path) -> None:
+            Path(path).write_text(f"ply\ncomment n_sq={self.n_sq}\n")
+
+    P, D, L, H, FFN = 8, 32, 1, 4, 64
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_dir = Path(tmp)
+        par_dir = tmp_dir / "par_base"
+        flow_dir = tmp_dir / "flow_model"
+        for d in (par_dir, flow_dir):
+            d.mkdir(parents=True, exist_ok=True)
+        base_args = {
+            "d_model": D, "queries": P, "layers": L, "heads": H, "ffn": FFN,
+            "vggt_layer": 23, "test": "dummy/test", "gt_sq": "dummy/gt_sq.npz",
+            "batch": 2, "eval_per_n": 2, "flow_steps": 3,
+        }
+        torch.save({"decoder": SQDecoder(D, P, L, H, FFN).state_dict(), "args": {**base_args}, "step": 10},
+                   par_dir / "decoder.pt")
+        torch.save({"decoder": FlowSQDenoiser(D, P, L, H, FFN, slot_init="sinus").state_dict(),
+                    "args": {**base_args, "decoder": "flow", "flow_slot_sinus": True}, "step": 10},
+                   flow_dir / "decoder.pt")
+
+        pool = DummyPool()
+        gt = DummyGT()
+        geom = DummyGeom()
+        csv_no_exp = tmp_dir / "no_exp.csv"
+        csv_with_exp = tmp_dir / "with_exp.csv"
+        export_dir = tmp_dir / "exported"
+        no_exp_dir = tmp_dir / "should_not_exist"
+
+        # 1. No export flag -> identical CSV and no export files written
+        with patch.object(eo_mod, "FrozenVGGT", lambda layer: DummyVGGT()), \
+             patch.object(eo_mod, "ViewPool", lambda p: pool), \
+             patch.object(eo_mod, "GeomTargets", lambda w, c, seed=0: geom), \
+             patch.object(eo_mod, "GTSuperquadrics", lambda p, deform=False: gt):
+            eval_main([
+                "--parallel", str(par_dir), "--flow", str(flow_dir),
+                "--k", "4", "--batch", "2", "--per-n", "2", "--device", "cpu",
+                "--out", str(csv_no_exp),
+            ])
+        assert not no_exp_dir.exists()
+
+        # 2. Export enabled for p=0.5 + halves, N in {1, 4}, samples=2, draws=3
+        with patch.object(eo_mod, "FrozenVGGT", lambda layer: DummyVGGT()), \
+             patch.object(eo_mod, "ViewPool", lambda p: pool), \
+             patch.object(eo_mod, "GeomTargets", lambda w, c, seed=0: geom), \
+             patch.object(eo_mod, "GTSuperquadrics", lambda p, deform=False: gt), \
+             patch.object(train_mod, "sq_mesh", lambda sc, *a, **kw: FakeMesh(len(sc))):
+            eval_main([
+                "--parallel", str(par_dir), "--flow", str(flow_dir),
+                "--k", "4", "--batch", "2", "--per-n", "2", "--device", "cpu",
+                "--out", str(csv_with_exp),
+                "--export-dir", str(export_dir), "--export-p", "0.5", "--export-halves",
+                "--export-n", "1", "4", "--export-samples", "2", "--export-draws", "3",
+            ])
+
+        assert csv_no_exp.read_text() == csv_with_exp.read_text(), "export changed CSV output"
+
+        # Verify expected directory layout and files for both models
+        for n in (1, 4):
+            for k_idx in (0, 1):
+                for m_lbl, exp_draws in [("parallel", 1), ("flow_model", 3)]:
+                    sdir = export_dir / m_lbl / f"p0.5_N{n}_{k_idx}"
+                    assert sdir.is_dir(), f"missing {sdir}"
+                    assert (sdir / "gt_sq.ply").is_file()
+                    assert (sdir / "sample.json").is_file()
+                    for j in range(exp_draws):
+                        assert (sdir / f"pred_sq_draw{j}.ply").is_file()
+                    assert not (sdir / f"pred_sq_draw{exp_draws}.ply").exists()
+
+                    clean_views = []
+                    occ_views = []
+                    for v in range(n):
+                        c_arr = np.array(Image.open(sdir / f"input_clean_{v}.png"))
+                        o_arr = np.array(Image.open(sdir / f"input_occluded_{v}.png"))
+                        clean_views.append(c_arr)
+                        occ_views.append(o_arr)
+                        diff = np.any(o_arr != c_arr, axis=-1)
+                        assert diff.any(), "expected occluded box pixels to differ from clean"
+                        ys, xs = np.where(diff)
+                        y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+                        # Inside bounding box: gray 0.5 -> uint8(128); outside bounding box: identical
+                        assert (o_arr[y0:y1, x0:x1] == 128).all()
+                        outside = np.ones(diff.shape, dtype=bool)
+                        outside[y0:y1, x0:x1] = False
+                        assert (o_arr[outside] == c_arr[outside]).all()
+                        box_frac = (y1 - y0) * (x1 - x0) / (64 * 64)
+                        assert abs(box_frac - 0.5) < 0.03, f"unexpected exported box frac {box_frac}"
+
+                    cmp_arr = np.array(Image.open(sdir / "input_compare.png"))
+                    assert cmp_arr.shape == (2 * 64, n * 64, 3)
+                    assert np.array_equal(cmp_arr[:64], np.concatenate(clean_views, axis=1))
+                    assert np.array_equal(cmp_arr[64:], np.concatenate(occ_views, axis=1))
+
+                    meta = json.loads((sdir / "sample.json").read_text())
+                    assert meta["N"] == n and len(meta["views"]) == n
+                    assert len(meta["draws"]) == exp_draws and len(meta["n_pred"]) == exp_draws
+                    assert "chamfer_world" in meta["draws"][0] and "iou" in meta["draws"][0]
+
+                # Also verify halves exported
+                hdir = export_dir / "flow_model" / f"half_left_N{n}_{k_idx}"
+                assert (hdir / "input_compare.png").is_file() and (hdir / "pred_sq_draw0.ply").is_file()
+                oc_l = np.array(Image.open(hdir / "input_occluded_0.png"))
+                cl_l = np.array(Image.open(hdir / "input_clean_0.png"))
+                assert (oc_l[:, :32] == 128).all() and np.array_equal(oc_l[:, 32:], cl_l[:, 32:])
+
+
 if __name__ == "__main__":
     test_occlusion_masks()
     test_load_and_eval_smoke()
     test_current_flow_checkpoints_and_multi_eval()
     test_augment_occlusion()
+    test_occlusion_export()
     print("ALL OCCLUSION EVAL SMOKE TESTS PASSED")
