@@ -37,7 +37,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from l2sq.data import GeomTargets, GTSuperquadrics, ViewPool, collate, make_sample, random_views
+from l2sq.data import GeomTargets, GTSuperquadrics, ViewPool, augment_occlusion, collate, make_sample, random_views
 from l2sq.flow_matching_decoder import FlowSQDenoiser, decode_sq, flow_group_stats, flow_loss, pack_sq, sample_euler
 from l2sq.geom_loss import chamfer_loss, occupancy_iou, superflex_loss
 from l2sq.model import FrozenVGGT, SQDecoder
@@ -288,6 +288,10 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--steps", type=int, default=3000)
     p.add_argument("--grad-clip", type=float, default=0.0,
                    help="max grad norm for safety guard (0 = off, default behavior); skips step with warning on non-finite loss/grad")
+    p.add_argument("--occlusion-p", type=float, default=0.0,
+                   help="enable random box occlusion training augmentation when > 0 (default 0.0 = off)")
+    p.add_argument("--occlusion-prob", type=float, default=0.5,
+                   help="per-view probability of applying random [0.25, 0.75] gray-0.5 box occlusion during training")
     p.add_argument("--batch", type=int, default=2, help="samples per step (each N views)")
     p.add_argument("--n-min", type=int, default=1)
     p.add_argument("--n-max", type=int, default=8)
@@ -486,9 +490,10 @@ def main(argv: list[str] | None = None) -> None:
         n = int(rng.integers(a.n_min, a.n_max + 1))
         batch = [make_sample(train_pool, gt, random_views(rng, len(train_pool), n)) for _ in range(a.batch)]
         tgt = collate(train_pool, batch, a.queries, device, geom, rng, a.n_surf, a.n_vol)
+        images = augment_occlusion(tgt["images"], a.occlusion_prob, rng) if a.occlusion_p > 0.0 else tgt["images"]
         _sync()
         tv0 = time.perf_counter()
-        tokens = vggt(tgt["images"])
+        tokens = vggt(images)
         _sync()
         td0 = time.perf_counter()
         t_vggt += td0 - tv0

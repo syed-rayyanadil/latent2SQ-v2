@@ -11,6 +11,7 @@ pixel, which keeps each view's weight proportional to its pixel count, as in VGG
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -160,3 +161,40 @@ def collate(pool: ViewPool, samples: list[Sample], P: int, device, geom: GeomTar
                    vol=torch.as_tensor(np.stack(vol), dtype=torch.float32),
                    occ=torch.as_tensor(np.stack(occ), dtype=torch.float32))
     return {k: (v.to(device) if k != "images" else v) for k, v in out.items()}
+
+
+def apply_box_occlusion(images: torch.Tensor, p: float, rng: np.random.Generator, fill: float = 0.5) -> torch.Tensor:
+    """Mask one random rectangle of area fraction `p` per view with mid-gray (`fill`)."""
+    out = images.clone()
+    if p <= 0.0:
+        return out
+    B, N, _, H, W = out.shape
+    target_area = p * H * W
+    r_min = max(p * H / W, 0.5)
+    r_max = min(H / (p * W), 2.0)
+    for b in range(B):
+        for v in range(N):
+            ratio = float(np.exp(rng.uniform(math.log(r_min), math.log(r_max)))) if r_max > r_min else r_min
+            bh = int(np.clip(round(math.sqrt(target_area * ratio)), 1, H))
+            bw = int(np.clip(round(target_area / bh), 1, W))
+            bh = int(np.clip(round(target_area / bw), 1, H))
+            y0 = int(rng.integers(0, H - bh + 1))
+            x0 = int(rng.integers(0, W - bw + 1))
+            out[b, v, :, y0:y0 + bh, x0:x0 + bw] = fill
+    return out
+
+
+def augment_occlusion(images: torch.Tensor, prob: float, rng: np.random.Generator,
+                      p_range: tuple[float, float] = (0.25, 0.75), fill: float = 0.5) -> torch.Tensor:
+    """With probability `prob` per view, mask a random box of area fraction in `p_range` using apply_box_occlusion."""
+    out = images.clone()
+    if prob <= 0.0:
+        return out
+    B, N = out.shape[:2]
+    lo, hi = p_range
+    for b in range(B):
+        for v in range(N):
+            if rng.random() < prob:
+                p_box = float(rng.uniform(lo, hi))
+                out[b:b + 1, v:v + 1] = apply_box_occlusion(out[b:b + 1, v:v + 1], p_box, rng, fill=fill)
+    return out

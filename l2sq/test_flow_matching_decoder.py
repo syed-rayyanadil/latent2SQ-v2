@@ -247,6 +247,51 @@ def test_train_py_flow_wiring() -> None:
         sd_skip = torch.load(out_gc_skip / "decoder.pt", map_location="cpu", weights_only=False)["decoder"]
         assert all(torch.isfinite(v).all() for v in sd_skip.values())
 
+        # Verify --occlusion-p / --occlusion-prob training augmentation (off by default, train-only when > 0)
+        assert args_gcd["occlusion_p"] == 0.0 and args_gcd["occlusion_prob"] == 0.5
+        seen_train_fracs: list[torch.Tensor] = []
+        seen_eval_clean: list[bool] = []
+        in_eval = False
+        orig_eval = train_mod.evaluate
+        orig_export = train_mod.export_examples
+
+        def tracked_eval(*args, **kwargs):
+            nonlocal in_eval
+            in_eval = True
+            try:
+                return orig_eval(*args, **kwargs)
+            finally:
+                in_eval = False
+
+        def tracked_export(*args, **kwargs):
+            nonlocal in_eval
+            in_eval = True
+            try:
+                return orig_export(*args, **kwargs)
+            finally:
+                in_eval = False
+
+        class TrackedVGGT(FakeVGGT):
+            def forward(self, images: torch.Tensor) -> torch.Tensor:
+                frac = (images[:, :, 0] == 0.5).float().mean(dim=(-2, -1))
+                if in_eval:
+                    seen_eval_clean.append(bool((frac == 0.0).all()))
+                else:
+                    seen_train_fracs.append(frac.cpu())
+                return super().forward(images)
+
+        out_occ = Path(tmp) / "run_occ_aug"
+        with patch.object(train_mod, "FrozenVGGT", TrackedVGGT), \
+             patch.object(train_mod, "evaluate", side_effect=tracked_eval), \
+             patch.object(train_mod, "export_examples", side_effect=tracked_export):
+            train_mod.main([*common_args, "--out", str(out_occ), "--occlusion-p", "0.5", "--occlusion-prob", "1.0"])
+        args_occ = json.loads((out_occ / "args.json").read_text())
+        assert args_occ["occlusion_p"] == 0.5 and args_occ["occlusion_prob"] == 1.0
+        assert len(seen_train_fracs) == 2
+        for fr in seen_train_fracs:
+            assert (fr >= 0.23).all() and (fr <= 0.77).all(), f"train box frac out of [0.25, 0.75]: {fr}"
+        assert len(seen_eval_clean) > 0 and all(seen_eval_clean), "evaluate() must not apply occlusion"
+
 
 def test_flow_repeat() -> None:
     torch.manual_seed(0)
